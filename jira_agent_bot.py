@@ -1,16 +1,13 @@
 """
-Telegram Jira Bot - Multi-Agent Architecture with Vision Support (Webhook Mode)
+Telegram Jira Bot - Multi-Agent Architecture with Vision Support (Pure Webhook Mode)
 使用 OpenAI Function Calling 和 Vision API 实现的 BUG 提交机器人
-采用 Webhook 模式提高稳定性
+采用纯 Webhook 模式，不使用 python-telegram-bot 的 polling 功能
 """
 import os
 import json
-import asyncio
 import requests
 import base64
 from flask import Flask, request, Response
-from telegram import Update, Bot
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from openai import OpenAI
 
 # --- Environment Variables ---
@@ -22,7 +19,7 @@ JIRA_EMAIL = os.getenv("JIRA_EMAIL")
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 JIRA_PROJECT_KEY = os.getenv("JIRA_PROJECT_KEY", "BB")
 PORT = int(os.getenv("PORT", 10000))
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # e.g., https://telegram-jira-bot-29j8.onrender.com
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 
 # --- Assignee IDs ---
 ASSIGNEE_DEV = "712020:29364cb3-1ba1-453c-8e28-4e0306787939"
@@ -34,8 +31,85 @@ client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_API_BASE) if OPENAI_API_
 # --- Flask App for Webhook ---
 app = Flask(__name__)
 
-# --- Global Application ---
-application = None
+# --- User Sessions and Pending Images ---
+user_sessions = {}
+pending_images = {}
+
+# --- Bot Username Cache ---
+bot_username_cache = None
+
+
+# ============================================================
+# Telegram API Helper Functions
+# ============================================================
+
+def telegram_api(method: str, data: dict = None) -> dict:
+    """调用 Telegram Bot API"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    try:
+        if data:
+            response = requests.post(url, json=data)
+        else:
+            response = requests.get(url)
+        return response.json()
+    except Exception as e:
+        print(f"Telegram API error: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+def send_message(chat_id: int, text: str, reply_to_message_id: int = None, parse_mode: str = "Markdown") -> dict:
+    """发送消息"""
+    data = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": parse_mode
+    }
+    if reply_to_message_id:
+        data["reply_to_message_id"] = reply_to_message_id
+    return telegram_api("sendMessage", data)
+
+
+def delete_message(chat_id: int, message_id: int) -> dict:
+    """删除消息"""
+    return telegram_api("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+
+
+def get_bot_username() -> str:
+    """获取机器人用户名"""
+    global bot_username_cache
+    if bot_username_cache is None:
+        result = telegram_api("getMe")
+        if result.get("ok"):
+            bot_username_cache = result["result"]["username"]
+    return bot_username_cache
+
+
+def download_file(file_id: str) -> tuple:
+    """下载 Telegram 文件"""
+    try:
+        # 获取文件路径
+        result = telegram_api("getFile", {"file_id": file_id})
+        if not result.get("ok"):
+            return None, None
+        
+        file_path = result["result"]["file_path"]
+        
+        # 下载文件
+        if file_path.startswith("http"):
+            download_url = file_path
+        else:
+            download_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+        
+        response = requests.get(download_url)
+        response.raise_for_status()
+        
+        filename = file_path.split('/')[-1] if '/' in file_path else f"photo_{file_id}.jpg"
+        print(f"Photo downloaded: {filename}, {len(response.content)} bytes")
+        
+        return response.content, filename
+    except Exception as e:
+        print(f"Error downloading file: {e}")
+        return None, None
 
 
 # ============================================================
@@ -45,36 +119,6 @@ application = None
 def encode_image_to_base64(image_bytes: bytes) -> str:
     """将图片字节转换为 base64 字符串"""
     return base64.b64encode(image_bytes).decode('utf-8')
-
-
-async def download_telegram_photo(bot: Bot, file_id: str) -> tuple:
-    """下载 Telegram 图片"""
-    try:
-        file = await bot.get_file(file_id)
-        file_path = file.file_path
-        
-        print(f"Telegram file_path: {file_path}")
-        
-        # 检查 file_path 是否已经是完整 URL
-        if file_path.startswith("http"):
-            download_url = file_path
-        else:
-            download_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
-        
-        print(f"Downloading from: {download_url}")
-        
-        response = requests.get(download_url)
-        response.raise_for_status()
-        
-        filename = file_path.split('/')[-1] if '/' in file_path else f"photo_{file_id}.jpg"
-        print(f"Photo downloaded successfully: {filename}, size: {len(response.content)} bytes")
-        
-        return response.content, filename
-    except Exception as e:
-        print(f"Error downloading photo: {e}")
-        import traceback
-        traceback.print_exc()
-        return None, None
 
 
 def analyze_image_with_vision(image_base64: str, user_text: str) -> str:
@@ -298,58 +342,31 @@ def get_jira_issue(issue_key: str) -> dict:
 
 
 # ============================================================
-# Agent System
+# OpenAI Function Calling Tools
 # ============================================================
 
-# 用户会话存储
-user_sessions = {}
-pending_images = {}
-
-SYSTEM_PROMPT = """你是一位资深的 QA 工程师和产品专家，专门帮助用户高效提交 BUG 到 Jira。
-
-## 核心原则
-1. **一次完成**：尽量从用户描述中提取所有信息，不要反复追问
-2. **专业分析**：为每个 BUG 提供技术根因分析
-3. **修复建议**：给出具体可行的修复方向
-
-## 工作流程
-当用户报告问题时：
-1. 快速理解问题本质
-2. 自动补全缺失信息（基于经验推断）
-3. 生成专业的 BUG 标题和描述
-4. 直接调用工具创建 Jira Issue
-
-## BUG 分类标准
-- **开发BUG**：功能异常、逻辑错误、接口问题、性能问题、数据问题
-- **UI/设计BUG**：样式问题、布局问题、动效问题、视觉不一致
-
-## 描述模板
-【问题描述】简明扼要描述问题现象
-【复现步骤】1. 2. 3.
-【预期结果】应该怎样
-【实际结果】实际怎样
-【影响范围】影响哪些用户/场景
-【技术分析】可能的技术原因
-【修复建议】建议的修复方向
-
-## 注意事项
-- 标题要简洁有力，包含模块名和问题关键词
-- 如果用户提供了截图分析，要在描述中引用
-- 不要问用户"还需要补充什么"，直接创建
-- 创建成功后给出简洁的确认信息"""
-
-TOOLS = [
+tools = [
     {
         "type": "function",
         "function": {
             "name": "create_jira_issue",
-            "description": "创建 Jira BUG Issue。当用户报告了一个问题或 BUG 时调用此工具。",
+            "description": "创建一个新的 Jira BUG Issue。当用户报告问题或 BUG 时调用此函数。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "title": {"type": "string", "description": "Issue 标题，简洁描述问题"},
-                    "description": {"type": "string", "description": "详细的问题描述，包含复现步骤、预期结果、实际结果等"},
-                    "bug_type": {"type": "string", "enum": ["开发BUG", "UI/设计BUG"], "description": "BUG 类型"}
+                    "title": {
+                        "type": "string",
+                        "description": "Issue 标题，简洁描述问题（不超过100字）"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "详细的 BUG 描述，包括：问题现象、复现步骤、预期行为、实际行为、可能原因、修复建议"
+                    },
+                    "bug_type": {
+                        "type": "string",
+                        "enum": ["开发BUG", "UI/UX问题"],
+                        "description": "BUG 类型：功能性问题选'开发BUG'，界面/交互问题选'UI/UX问题'"
+                    }
                 },
                 "required": ["title", "description", "bug_type"]
             }
@@ -359,11 +376,14 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "search_jira_issues",
-            "description": "搜索已有的 Jira Issues",
+            "description": "搜索已存在的 Jira Issues。当用户想查找相关问题时调用。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "搜索关键词"}
+                    "query": {
+                        "type": "string",
+                        "description": "搜索关键词"
+                    }
                 },
                 "required": ["query"]
             }
@@ -372,12 +392,15 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "get_jira_issue",
-            "description": "获取指定 Jira Issue 的详情",
+            "name": "get_jira_issue_detail",
+            "description": "获取指定 Jira Issue 的详细信息。当用户想查看某个 Issue 详情时调用。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "issue_key": {"type": "string", "description": "Issue 编号，如 BB-123"}
+                    "issue_key": {
+                        "type": "string",
+                        "description": "Issue 编号，如 BB-123"
+                    }
                 },
                 "required": ["issue_key"]
             }
@@ -385,6 +408,10 @@ TOOLS = [
     }
 ]
 
+
+# ============================================================
+# Session Management
+# ============================================================
 
 def get_user_session(user_id: int) -> list:
     """获取用户会话历史"""
@@ -397,81 +424,63 @@ def add_to_session(user_id: int, role: str, content: str):
     """添加消息到会话"""
     session = get_user_session(user_id)
     session.append({"role": role, "content": content})
-    if len(session) > 20:
-        session.pop(0)
+    # 保持最近10条消息
+    if len(session) > 10:
+        user_sessions[user_id] = session[-10:]
 
 
 def clear_user_session(user_id: int):
     """清除用户会话"""
     if user_id in user_sessions:
-        user_sessions[user_id] = []
+        del user_sessions[user_id]
+    if user_id in pending_images:
+        del pending_images[user_id]
 
 
-def execute_tool(tool_name: str, arguments: dict, user_id: int) -> str:
-    """执行工具调用"""
-    print(f"执行工具: {tool_name}, 参数: {arguments}")
-    
-    if tool_name == "create_jira_issue":
-        result = create_jira_issue(
-            title=arguments.get("title", ""),
-            description=arguments.get("description", ""),
-            bug_type=arguments.get("bug_type", "开发BUG")
-        )
-        
-        if result["success"]:
-            # 如果有待上传的图片，上传到 Jira
-            if user_id in pending_images:
-                image_data = pending_images[user_id]
-                upload_result = upload_attachment_to_jira(
-                    result["issue_key"],
-                    image_data["bytes"],
-                    image_data["filename"]
-                )
-                del pending_images[user_id]
-                
-                if upload_result["success"]:
-                    print(f"Attachment uploaded successfully to {result['issue_key']}")
-            
-            return f"✅ BUG 已提交到 Jira!\n\n📋 **Issue 信息**\n• 编号：{result['issue_key']}\n• 标题：{result['title']}\n• 类型：{result['bug_type']}\n\n🔗 {result['issue_url']}"
-        else:
-            return f"❌ Jira 创建失败：{result['error']}"
-    
-    elif tool_name == "search_jira_issues":
-        result = search_jira_issues(arguments.get("query", ""))
-        if result["success"]:
-            if result["count"] == 0:
-                return "未找到相关 Issue"
-            issues_text = "\n".join([f"• [{i['key']}] {i['summary']} ({i['status']})" for i in result["issues"]])
-            return f"🔍 找到 {result['count']} 个相关 Issue:\n{issues_text}"
-        return f"搜索失败：{result['error']}"
-    
-    elif tool_name == "get_jira_issue":
-        result = get_jira_issue(arguments.get("issue_key", ""))
-        if result["success"]:
-            return f"📋 **{result['key']}**\n• 标题：{result['summary']}\n• 状态：{result['status']}\n• 链接：{result['url']}"
-        return f"获取失败：{result['error']}"
-    
-    return "未知工具"
+# ============================================================
+# Agent Logic
+# ============================================================
 
-
-async def run_agent(user_id: int, user_message: str, image_analysis: str = None) -> str:
+def run_agent(user_id: int, user_message: str, image_analysis: str = None) -> str:
     """运行 Agent 处理用户消息"""
-    
-    # 构建完整的用户消息
-    full_message = user_message
-    if image_analysis:
-        full_message = f"{user_message}\n\n【截图分析】\n{image_analysis}"
-    
-    add_to_session(user_id, "user", full_message)
-    
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + get_user_session(user_id)
-    
     try:
+        # 构建消息
+        if image_analysis:
+            full_message = f"用户描述：{user_message}\n\n截图分析结果：\n{image_analysis}"
+        else:
+            full_message = user_message
+        
+        add_to_session(user_id, "user", full_message)
+        
+        system_prompt = """你是一位专业的软件测试工程师和 BUG 分析专家。你的任务是：
+
+1. **分析用户报告的问题**：理解问题的本质，判断是功能BUG还是UI问题
+2. **直接创建 Issue**：不要反复询问，根据用户描述直接创建 Jira Issue
+3. **专业的 BUG 描述**：生成结构化的 BUG 报告，包括：
+   - 问题现象
+   - 复现步骤（如果可以推断）
+   - 预期行为 vs 实际行为
+   - 可能的根本原因分析
+   - 建议的修复方向
+
+4. **智能分类**：
+   - 功能异常、数据错误、性能问题 → 开发BUG
+   - 界面显示、交互体验、视觉问题 → UI/UX问题
+
+5. **如果用户提供了截图分析**：结合截图内容丰富 BUG 描述
+
+请直接行动，高效处理用户的问题。"""
+
+        messages = [{"role": "system", "content": system_prompt}]
+        messages.extend(get_user_session(user_id))
+        
+        # 调用 OpenAI
         response = client.chat.completions.create(
-            model="gpt-5.2",
+            model="gpt-5",
             messages=messages,
-            tools=TOOLS,
-            tool_choice="auto"
+            tools=tools,
+            tool_choice="auto",
+            max_completion_tokens=2000
         )
         
         assistant_message = response.choices[0].message
@@ -479,33 +488,86 @@ async def run_agent(user_id: int, user_message: str, image_analysis: str = None)
         # 处理工具调用
         if assistant_message.tool_calls:
             tool_results = []
+            
             for tool_call in assistant_message.tool_calls:
-                tool_name = tool_call.function.name
-                arguments = json.loads(tool_call.function.arguments)
-                result = execute_tool(tool_name, arguments, user_id)
-                tool_results.append(result)
+                function_name = tool_call.function.name
+                function_args = json.loads(tool_call.function.arguments)
+                
+                print(f"Tool call: {function_name} with args: {function_args}")
+                
+                if function_name == "create_jira_issue":
+                    result = create_jira_issue(
+                        function_args["title"],
+                        function_args["description"],
+                        function_args["bug_type"]
+                    )
+                    
+                    # 如果有待上传的图片，上传到 Issue
+                    if result.get("success") and user_id in pending_images:
+                        image_data = pending_images[user_id]
+                        upload_result = upload_attachment_to_jira(
+                            result["issue_key"],
+                            image_data["bytes"],
+                            image_data["filename"]
+                        )
+                        if upload_result.get("success"):
+                            result["attachment_uploaded"] = True
+                        del pending_images[user_id]
+                    
+                    tool_results.append({
+                        "tool_call_id": tool_call.id,
+                        "output": json.dumps(result, ensure_ascii=False)
+                    })
+                    
+                elif function_name == "search_jira_issues":
+                    result = search_jira_issues(function_args["query"])
+                    tool_results.append({
+                        "tool_call_id": tool_call.id,
+                        "output": json.dumps(result, ensure_ascii=False)
+                    })
+                    
+                elif function_name == "get_jira_issue_detail":
+                    result = get_jira_issue(function_args["issue_key"])
+                    tool_results.append({
+                        "tool_call_id": tool_call.id,
+                        "output": json.dumps(result, ensure_ascii=False)
+                    })
             
-            final_response = "\n\n".join(tool_results)
-            add_to_session(user_id, "assistant", final_response)
-            return final_response
+            # 将工具结果发送回 OpenAI 获取最终回复
+            messages.append({"role": "assistant", "content": None, "tool_calls": assistant_message.tool_calls})
+            for tr in tool_results:
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tr["tool_call_id"],
+                    "content": tr["output"]
+                })
+            
+            final_response = client.chat.completions.create(
+                model="gpt-5",
+                messages=messages,
+                max_completion_tokens=1000
+            )
+            
+            reply = final_response.choices[0].message.content
         else:
-            content = assistant_message.content or "我理解了你的问题，请提供更多细节。"
-            add_to_session(user_id, "assistant", content)
-            return content
-            
+            reply = assistant_message.content
+        
+        add_to_session(user_id, "assistant", reply)
+        return reply
+        
     except Exception as e:
-        error_msg = f"处理失败：{str(e)}"
-        print(f"Agent error: {e}")
+        error_msg = f"Agent 处理失败：{str(e)}"
+        print(error_msg)
         import traceback
         traceback.print_exc()
         return error_msg
 
 
 # ============================================================
-# Telegram Handlers
+# Message Handlers
 # ============================================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def handle_start_command(chat_id: int, message_id: int):
     """处理 /start 命令"""
     welcome_message = """
 👋 **欢迎使用 Jira BUG 提交助手！**
@@ -529,10 +591,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 有问题随时 @我！
 """
-    await update.message.reply_text(welcome_message, parse_mode="Markdown")
+    send_message(chat_id, welcome_message, message_id)
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def handle_help_command(chat_id: int, message_id: int):
     """处理 /help 命令"""
     help_message = """
 📖 **使用帮助**
@@ -556,59 +618,47 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • /clear - 清除对话历史，开始新对话
 • /start - 查看欢迎信息
 """
-    await update.message.reply_text(help_message, parse_mode="Markdown")
+    send_message(chat_id, help_message, message_id)
 
 
-async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def handle_clear_command(chat_id: int, message_id: int, user_id: int):
     """处理 /clear 命令"""
-    user_id = update.effective_user.id
     clear_user_session(user_id)
-    await update.message.reply_text("✅ 对话历史已清除，我们可以开始新的对话了！")
+    send_message(chat_id, "✅ 对话历史已清除，我们可以开始新的对话了！", message_id)
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """处理用户消息（包括图片）"""
-    if not update.message:
-        return
-
-    bot_username = (await context.bot.get_me()).username
-    
-    # 获取消息文本和图片
-    message_text = update.message.text or update.message.caption or ""
-    photo = update.message.photo[-1] if update.message.photo else None
+def handle_user_message(chat_id: int, message_id: int, user_id: int, text: str, photo_file_id: str = None):
+    """处理用户消息"""
+    bot_username = get_bot_username()
     
     # 只在被 @ 时触发
-    is_mentioned = f"@{bot_username}" in message_text
-    
-    if not is_mentioned:
+    if not bot_username or f"@{bot_username}" not in text:
         return
-
-    user_id = update.effective_user.id
-    user_message = message_text.replace(f"@{bot_username}", "").strip()
     
-    if not user_message and not photo:
-        await update.message.reply_text("请告诉我你遇到了什么问题？可以附上截图。")
+    user_message = text.replace(f"@{bot_username}", "").strip()
+    
+    if not user_message and not photo_file_id:
+        send_message(chat_id, "请告诉我你遇到了什么问题？可以附上截图。", message_id)
         return
     
     # 发送"正在处理"提示
-    if photo:
-        processing_msg = await update.message.reply_text("🖼️ 正在分析截图和问题...")
+    if photo_file_id:
+        processing_result = send_message(chat_id, "🖼️ 正在分析截图和问题...", message_id)
     else:
-        processing_msg = await update.message.reply_text("🤔 正在分析你的问题...")
-
+        processing_result = send_message(chat_id, "🤔 正在分析你的问题...", message_id)
+    
+    processing_msg_id = processing_result.get("result", {}).get("message_id") if processing_result.get("ok") else None
+    
     try:
         image_analysis = None
         
         # 如果有图片，下载并分析
-        if photo:
-            print(f"Processing photo: {photo.file_id}")
+        if photo_file_id:
+            print(f"Processing photo: {photo_file_id}")
             
-            # 下载图片
-            image_bytes, filename = await download_telegram_photo(context.bot, photo.file_id)
+            image_bytes, filename = download_file(photo_file_id)
             
             if image_bytes:
-                print(f"Photo downloaded: {filename}, {len(image_bytes)} bytes")
-                
                 # 存储图片用于后续上传到 Jira
                 pending_images[user_id] = {
                     "bytes": image_bytes,
@@ -618,33 +668,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # 使用 Vision API 分析图片
                 image_base64 = encode_image_to_base64(image_bytes)
                 image_analysis = analyze_image_with_vision(image_base64, user_message or "请分析这张截图中的问题")
-                
-                print(f"Image analysis completed")
             else:
-                print("Failed to download photo")
                 image_analysis = "截图下载失败，将仅根据文字描述处理。"
         
         # 运行 Agent
-        reply = await run_agent(user_id, user_message or "请根据截图分析问题", image_analysis)
+        reply = run_agent(user_id, user_message or "请根据截图分析问题", image_analysis)
         
         # 删除"正在处理"消息
-        await processing_msg.delete()
+        if processing_msg_id:
+            delete_message(chat_id, processing_msg_id)
         
         # 发送回复
-        await update.message.reply_text(reply)
-
+        send_message(chat_id, reply, message_id)
+        
     except Exception as e:
         error_message = str(e)
         print(f"Error processing message: {error_message}")
         import traceback
         traceback.print_exc()
         
-        try:
-            await processing_msg.delete()
-        except:
-            pass
+        if processing_msg_id:
+            delete_message(chat_id, processing_msg_id)
         
-        await update.message.reply_text(f"❌ 处理失败：{error_message}")
+        send_message(chat_id, f"❌ 处理失败：{error_message}", message_id)
 
 
 # ============================================================
@@ -654,25 +700,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @app.route('/', methods=['GET'])
 def health_check():
     """健康检查端点"""
-    return 'OK - Telegram Jira Agent Bot with Vision is running (Webhook Mode)'
+    return 'OK - Telegram Jira Agent Bot with Vision is running (Pure Webhook Mode)'
 
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
     """Webhook 端点，接收 Telegram 更新"""
-    global application
-    
-    if application is None:
-        return Response('Application not initialized', status=500)
-    
     try:
-        update_data = request.get_json(force=True)
-        update = Update.de_json(update_data, application.bot)
+        update = request.get_json(force=True)
+        print(f"Received update: {json.dumps(update, ensure_ascii=False)[:500]}")
         
-        # 异步处理更新
-        asyncio.run(application.process_update(update))
+        message = update.get("message")
+        if not message:
+            return Response('OK', status=200)
+        
+        chat_id = message.get("chat", {}).get("id")
+        message_id = message.get("message_id")
+        user_id = message.get("from", {}).get("id")
+        text = message.get("text") or message.get("caption") or ""
+        
+        # 处理命令
+        if text.startswith("/start"):
+            handle_start_command(chat_id, message_id)
+        elif text.startswith("/help"):
+            handle_help_command(chat_id, message_id)
+        elif text.startswith("/clear"):
+            handle_clear_command(chat_id, message_id, user_id)
+        else:
+            # 处理普通消息
+            photo_file_id = None
+            if message.get("photo"):
+                # 获取最大尺寸的图片
+                photo_file_id = message["photo"][-1]["file_id"]
+            
+            handle_user_message(chat_id, message_id, user_id, text, photo_file_id)
         
         return Response('OK', status=200)
+        
     except Exception as e:
         print(f"Webhook error: {e}")
         import traceback
@@ -689,48 +753,18 @@ def setup_webhook():
     webhook_url = f"{WEBHOOK_URL}/webhook"
     
     # 先删除旧的 webhook
-    delete_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true"
-    try:
-        response = requests.get(delete_url)
-        print(f"Delete webhook response: {response.json()}")
-    except Exception as e:
-        print(f"Error deleting webhook: {e}")
+    delete_result = telegram_api("deleteWebhook", {"drop_pending_updates": True})
+    print(f"Delete webhook response: {delete_result}")
     
     # 设置新的 webhook
-    set_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
-    payload = {
+    set_result = telegram_api("setWebhook", {
         "url": webhook_url,
         "drop_pending_updates": True,
         "allowed_updates": ["message", "edited_message"]
-    }
+    })
+    print(f"Set webhook response: {set_result}")
     
-    try:
-        response = requests.post(set_url, json=payload)
-        result = response.json()
-        print(f"Set webhook response: {result}")
-        return result.get("ok", False)
-    except Exception as e:
-        print(f"Error setting webhook: {e}")
-        return False
-
-
-def init_application():
-    """初始化 Telegram Application"""
-    global application
-    
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    
-    # 添加处理器
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("clear", clear_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(MessageHandler(filters.PHOTO, handle_message))
-    
-    # 初始化 application
-    asyncio.get_event_loop().run_until_complete(application.initialize())
-    
-    print("Telegram Application initialized")
+    return set_result.get("ok", False)
 
 
 # ============================================================
@@ -738,10 +772,9 @@ def init_application():
 # ============================================================
 
 if __name__ == "__main__":
-    print("Starting Jira Agent Bot in Webhook Mode...")
-    
-    # 初始化 Telegram Application
-    init_application()
+    print("Starting Jira Agent Bot in Pure Webhook Mode...")
+    print(f"WEBHOOK_URL: {WEBHOOK_URL}")
+    print(f"PORT: {PORT}")
     
     # 设置 Webhook
     if setup_webhook():
