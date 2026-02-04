@@ -2,6 +2,7 @@ import os
 import json
 import requests
 import threading
+import asyncio
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -53,7 +54,7 @@ JSON格式要求：
 用户报告：
 {text}"""
     data = {
-        "model": "gpt-5.2",
+        "model": "gpt-4o-mini",
         "messages": [{"role": "user", "content": prompt}],
         "response_format": {"type": "json_object"}
     }
@@ -156,14 +157,24 @@ def main():
     health_thread = threading.Thread(target=start_health_server, daemon=True)
     health_thread.start()
     
-    # Start Telegram bot
+    # Delete any existing webhook first to avoid conflicts
+    print("Deleting any existing webhook...")
+    delete_webhook_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true"
+    try:
+        response = requests.get(delete_webhook_url)
+        print(f"Webhook deleted: {response.json()}")
+    except Exception as e:
+        print(f"Warning: Could not delete webhook: {e}")
+    
+    # Start Telegram bot with drop_pending_updates to avoid conflicts
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print("Telegram Bot is running...")
-    application.run_polling()
+    # Use drop_pending_updates=True to avoid processing old messages and conflicts
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
