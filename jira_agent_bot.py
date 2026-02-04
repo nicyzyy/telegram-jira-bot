@@ -2,6 +2,7 @@
 Telegram Jira Bot - Multi-Agent Architecture with Vision Support (Pure Webhook Mode)
 使用 OpenAI Function Calling 和 Vision API 实现的 BUG 提交机器人
 采用纯 Webhook 模式，添加消息去重和异步处理机制
+v3: 优化用户体验 - 即时反馈 + 精简回复
 """
 import os
 import json
@@ -119,6 +120,24 @@ def send_message(chat_id: int, text: str, reply_to_message_id: int = None, parse
     if not result.get("ok") and "parse" in str(result.get("description", "")).lower():
         data["parse_mode"] = None
         result = telegram_api("sendMessage", data)
+    
+    return result
+
+
+def edit_message(chat_id: int, message_id: int, text: str, parse_mode: str = "Markdown") -> dict:
+    """编辑消息"""
+    data = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": parse_mode
+    }
+    result = telegram_api("editMessageText", data)
+    
+    # 如果 Markdown 解析失败，尝试不带格式
+    if not result.get("ok") and "parse" in str(result.get("description", "")).lower():
+        data["parse_mode"] = None
+        result = telegram_api("editMessageText", data)
     
     return result
 
@@ -495,8 +514,11 @@ def clear_user_session(user_id: int):
 # Agent Logic
 # ============================================================
 
-def run_agent(user_id: int, user_message: str, image_analysis: str = None) -> str:
-    """运行 Agent 处理用户消息"""
+def run_agent(user_id: int, user_message: str, image_analysis: str = None) -> dict:
+    """
+    运行 Agent 处理用户消息
+    返回: {"reply": str, "jira_result": dict or None}
+    """
     try:
         # 构建消息
         if image_analysis:
@@ -539,6 +561,8 @@ def run_agent(user_id: int, user_message: str, image_analysis: str = None) -> st
         
         assistant_message = response.choices[0].message
         
+        jira_result = None
+        
         # 处理工具调用
         if assistant_message.tool_calls:
             tool_results = []
@@ -568,6 +592,7 @@ def run_agent(user_id: int, user_message: str, image_analysis: str = None) -> st
                             result["attachment_uploaded"] = True
                         del pending_images[user_id]
                     
+                    jira_result = result
                     tool_results.append({
                         "tool_call_id": tool_call.id,
                         "output": json.dumps(result, ensure_ascii=False)
@@ -607,14 +632,14 @@ def run_agent(user_id: int, user_message: str, image_analysis: str = None) -> st
             reply = assistant_message.content
         
         add_to_session(user_id, "assistant", reply)
-        return reply
+        return {"reply": reply, "jira_result": jira_result}
         
     except Exception as e:
         error_msg = f"Agent 处理失败：{str(e)}"
         print(error_msg)
         import traceback
         traceback.print_exc()
-        return error_msg
+        return {"reply": error_msg, "jira_result": None}
 
 
 # ============================================================
@@ -677,9 +702,36 @@ def handle_clear_command(chat_id: int, message_id: int, user_id: int):
     send_message(chat_id, "✅ 对话历史已清除，我们可以开始新的对话了！", message_id, parse_mode=None)
 
 
+def format_jira_success_message(jira_result: dict) -> str:
+    """格式化 Jira 创建成功的精简消息"""
+    issue_key = jira_result.get("issue_key", "")
+    issue_url = jira_result.get("issue_url", "")
+    title = jira_result.get("title", "")
+    bug_type = jira_result.get("bug_type", "")
+    has_attachment = jira_result.get("attachment_uploaded", False)
+    
+    # 截断过长的标题
+    if len(title) > 50:
+        title = title[:47] + "..."
+    
+    # 构建精简消息
+    lines = [
+        f"✅ 已创建 Jira Issue: **{issue_key}**",
+        f"📋 {title}",
+        f"🏷️ 类型: {bug_type}",
+    ]
+    
+    if has_attachment:
+        lines.append("📎 截图已附加")
+    
+    lines.append(f"🔗 {issue_url}")
+    
+    return "\n".join(lines)
+
+
 def process_message_async(chat_id: int, message_id: int, user_id: int, text: str, photo_file_id: str = None):
     """异步处理用户消息"""
-    processing_msg_id = None
+    status_msg_id = None
     
     try:
         bot_username = get_bot_username()
@@ -694,19 +746,24 @@ def process_message_async(chat_id: int, message_id: int, user_id: int, text: str
             send_message(chat_id, "请告诉我你遇到了什么问题？可以附上截图。", message_id, parse_mode=None)
             return
         
-        # 发送"正在处理"提示
+        # 第一步：立即发送确认消息
         if photo_file_id:
-            processing_result = send_message(chat_id, "🖼️ 正在分析截图和问题...", message_id, parse_mode=None)
+            status_text = "📸 收到截图，正在分析图片和问题..."
         else:
-            processing_result = send_message(chat_id, "🤔 正在分析你的问题...", message_id, parse_mode=None)
+            status_text = "📝 收到问题，正在分析..."
         
-        processing_msg_id = processing_result.get("result", {}).get("message_id") if processing_result.get("ok") else None
+        status_result = send_message(chat_id, status_text, message_id, parse_mode=None)
+        status_msg_id = status_result.get("result", {}).get("message_id") if status_result.get("ok") else None
         
         image_analysis = None
         
         # 如果有图片，下载并分析
         if photo_file_id:
             print(f"Processing photo: {photo_file_id}")
+            
+            # 更新状态：正在下载图片
+            if status_msg_id:
+                edit_message(chat_id, status_msg_id, "📸 正在下载截图...", parse_mode=None)
             
             image_bytes, filename = download_file(photo_file_id)
             
@@ -717,21 +774,41 @@ def process_message_async(chat_id: int, message_id: int, user_id: int, text: str
                     "filename": filename
                 }
                 
+                # 更新状态：正在分析图片
+                if status_msg_id:
+                    edit_message(chat_id, status_msg_id, "🔍 正在分析截图内容...", parse_mode=None)
+                
                 # 使用 Vision API 分析图片
                 image_base64 = encode_image_to_base64(image_bytes)
                 image_analysis = analyze_image_with_vision(image_base64, user_message or "请分析这张截图中的问题")
             else:
                 image_analysis = "截图下载失败，将仅根据文字描述处理。"
         
+        # 更新状态：正在创建 Issue
+        if status_msg_id:
+            edit_message(chat_id, status_msg_id, "⏳ 正在创建 Jira Issue...", parse_mode=None)
+        
         # 运行 Agent
-        reply = run_agent(user_id, user_message or "请根据截图分析问题", image_analysis)
+        result = run_agent(user_id, user_message or "请根据截图分析问题", image_analysis)
         
-        # 删除"正在处理"消息
-        if processing_msg_id:
-            delete_message(chat_id, processing_msg_id)
+        # 删除状态消息
+        if status_msg_id:
+            delete_message(chat_id, status_msg_id)
         
-        # 发送回复
-        send_message(chat_id, reply, message_id)
+        # 发送最终回复
+        jira_result = result.get("jira_result")
+        
+        if jira_result and jira_result.get("success"):
+            # Jira 创建成功，发送精简消息
+            reply = format_jira_success_message(jira_result)
+            send_message(chat_id, reply, message_id)
+        else:
+            # 其他情况（搜索、查询、或失败），使用原始回复
+            reply = result.get("reply", "处理完成")
+            # 如果回复太长，截断
+            if len(reply) > 500:
+                reply = reply[:497] + "..."
+            send_message(chat_id, reply, message_id)
         
     except Exception as e:
         error_message = str(e)
@@ -739,8 +816,8 @@ def process_message_async(chat_id: int, message_id: int, user_id: int, text: str
         import traceback
         traceback.print_exc()
         
-        if processing_msg_id:
-            delete_message(chat_id, processing_msg_id)
+        if status_msg_id:
+            delete_message(chat_id, status_msg_id)
         
         send_message(chat_id, f"❌ 处理失败：{error_message}", message_id, parse_mode=None)
 
@@ -763,7 +840,7 @@ def handle_user_message(chat_id: int, message_id: int, user_id: int, text: str, 
 @app.route('/', methods=['GET'])
 def health_check():
     """健康检查端点"""
-    return 'OK - Telegram Jira Agent Bot with Vision is running (Pure Webhook Mode v2)'
+    return 'OK - Telegram Jira Agent Bot with Vision is running (Pure Webhook Mode v3)'
 
 
 @app.route('/webhook', methods=['POST'])
@@ -844,7 +921,7 @@ def setup_webhook():
 # ============================================================
 
 if __name__ == "__main__":
-    print("Starting Jira Agent Bot in Pure Webhook Mode v2...")
+    print("Starting Jira Agent Bot in Pure Webhook Mode v3...")
     print(f"WEBHOOK_URL: {WEBHOOK_URL}")
     print(f"PORT: {PORT}")
     
