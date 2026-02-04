@@ -121,9 +121,11 @@ def send_message(chat_id: int, text: str, reply_to_message_id: int = None, parse
     
     data = {
         "chat_id": chat_id,
-        "text": text,
-        "parse_mode": parse_mode
+        "text": text
     }
+    # 只有当 parse_mode 有值时才添加到请求中
+    if parse_mode:
+        data["parse_mode"] = parse_mode
     if reply_to_message_id:
         data["reply_to_message_id"] = reply_to_message_id
     
@@ -131,7 +133,7 @@ def send_message(chat_id: int, text: str, reply_to_message_id: int = None, parse
     
     # 如果 Markdown 解析失败，尝试不带格式发送
     if not result.get("ok") and "parse" in str(result.get("description", "")).lower():
-        data["parse_mode"] = None
+        data.pop("parse_mode", None)  # 移除 parse_mode
         result = telegram_api("sendMessage", data)
     
     return result
@@ -142,14 +144,17 @@ def edit_message(chat_id: int, message_id: int, text: str, parse_mode: str = "Ma
     data = {
         "chat_id": chat_id,
         "message_id": message_id,
-        "text": text,
-        "parse_mode": parse_mode
+        "text": text
     }
+    # 只有当 parse_mode 有值时才添加到请求中
+    if parse_mode:
+        data["parse_mode"] = parse_mode
+    
     result = telegram_api("editMessageText", data)
     
     # 如果 Markdown 解析失败，尝试不带格式
     if not result.get("ok") and "parse" in str(result.get("description", "")).lower():
-        data["parse_mode"] = None
+        data.pop("parse_mode", None)  # 移除 parse_mode
         result = telegram_api("editMessageText", data)
     
     return result
