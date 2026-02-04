@@ -1,12 +1,15 @@
 """
 Telegram Jira Bot - Multi-Agent Architecture with Vision Support (Pure Webhook Mode)
 使用 OpenAI Function Calling 和 Vision API 实现的 BUG 提交机器人
-采用纯 Webhook 模式，不使用 python-telegram-bot 的 polling 功能
+采用纯 Webhook 模式，添加消息去重和异步处理机制
 """
 import os
 import json
 import requests
 import base64
+import threading
+import time
+from collections import OrderedDict
 from flask import Flask, request, Response
 from openai import OpenAI
 
@@ -38,6 +41,45 @@ pending_images = {}
 # --- Bot Username Cache ---
 bot_username_cache = None
 
+# --- Message Deduplication Cache (LRU with TTL) ---
+class MessageCache:
+    """消息去重缓存，使用 LRU + TTL 策略"""
+    def __init__(self, max_size=1000, ttl_seconds=300):
+        self.cache = OrderedDict()
+        self.max_size = max_size
+        self.ttl = ttl_seconds
+        self.lock = threading.Lock()
+    
+    def is_duplicate(self, update_id: int) -> bool:
+        """检查是否是重复消息"""
+        with self.lock:
+            current_time = time.time()
+            
+            # 清理过期条目
+            expired_keys = [k for k, v in self.cache.items() if current_time - v > self.ttl]
+            for k in expired_keys:
+                del self.cache[k]
+            
+            # 检查是否存在
+            if update_id in self.cache:
+                return True
+            
+            # 添加新条目
+            self.cache[update_id] = current_time
+            
+            # 如果超过最大容量，删除最旧的
+            while len(self.cache) > self.max_size:
+                self.cache.popitem(last=False)
+            
+            return False
+
+# 全局消息缓存
+message_cache = MessageCache()
+
+# --- Processing Status Cache ---
+processing_messages = {}
+processing_lock = threading.Lock()
+
 
 # ============================================================
 # Telegram API Helper Functions
@@ -48,9 +90,9 @@ def telegram_api(method: str, data: dict = None) -> dict:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
     try:
         if data:
-            response = requests.post(url, json=data)
+            response = requests.post(url, json=data, timeout=30)
         else:
-            response = requests.get(url)
+            response = requests.get(url, timeout=30)
         return response.json()
     except Exception as e:
         print(f"Telegram API error: {e}")
@@ -59,6 +101,10 @@ def telegram_api(method: str, data: dict = None) -> dict:
 
 def send_message(chat_id: int, text: str, reply_to_message_id: int = None, parse_mode: str = "Markdown") -> dict:
     """发送消息"""
+    # 如果文本太长，截断
+    if len(text) > 4000:
+        text = text[:3997] + "..."
+    
     data = {
         "chat_id": chat_id,
         "text": text,
@@ -66,7 +112,15 @@ def send_message(chat_id: int, text: str, reply_to_message_id: int = None, parse
     }
     if reply_to_message_id:
         data["reply_to_message_id"] = reply_to_message_id
-    return telegram_api("sendMessage", data)
+    
+    result = telegram_api("sendMessage", data)
+    
+    # 如果 Markdown 解析失败，尝试不带格式发送
+    if not result.get("ok") and "parse" in str(result.get("description", "")).lower():
+        data["parse_mode"] = None
+        result = telegram_api("sendMessage", data)
+    
+    return result
 
 
 def delete_message(chat_id: int, message_id: int) -> dict:
@@ -100,7 +154,7 @@ def download_file(file_id: str) -> tuple:
         else:
             download_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
         
-        response = requests.get(download_url)
+        response = requests.get(download_url, timeout=60)
         response.raise_for_status()
         
         filename = file_path.split('/')[-1] if '/' in file_path else f"photo_{file_id}.jpg"
@@ -236,7 +290,7 @@ def create_jira_issue(title: str, description: str, bug_type: str) -> dict:
         }
 
         print(f"Creating Jira issue with title: {title}")
-        response = requests.post(url, headers=headers, auth=auth, data=json.dumps(payload))
+        response = requests.post(url, headers=headers, auth=auth, data=json.dumps(payload), timeout=30)
         
         if response.status_code >= 400:
             print(f"Jira API error: {response.status_code} - {response.text}")
@@ -280,7 +334,7 @@ def upload_attachment_to_jira(issue_key: str, image_bytes: bytes, filename: str)
         }
         
         print(f"Uploading attachment to {issue_key}...")
-        response = requests.post(url, headers=headers, auth=auth, files=files)
+        response = requests.post(url, headers=headers, auth=auth, files=files, timeout=60)
         response.raise_for_status()
         
         print(f"Attachment uploaded successfully to {issue_key}")
@@ -301,7 +355,7 @@ def search_jira_issues(query: str) -> dict:
         jql = f'project = {JIRA_PROJECT_KEY} AND (summary ~ "{query}" OR description ~ "{query}") ORDER BY created DESC'
         payload = {"jql": jql, "maxResults": 5, "fields": ["summary", "status", "created", "assignee"]}
         
-        response = requests.post(url, headers=headers, auth=auth, data=json.dumps(payload))
+        response = requests.post(url, headers=headers, auth=auth, data=json.dumps(payload), timeout=30)
         response.raise_for_status()
         
         issues = response.json().get("issues", [])
@@ -326,7 +380,7 @@ def get_jira_issue(issue_key: str) -> dict:
         auth = (JIRA_EMAIL, JIRA_API_TOKEN)
         headers = {"Accept": "application/json"}
         
-        response = requests.get(url, headers=headers, auth=auth)
+        response = requests.get(url, headers=headers, auth=auth, timeout=30)
         response.raise_for_status()
         
         issue = response.json()
@@ -569,87 +623,85 @@ def run_agent(user_id: int, user_message: str, image_analysis: str = None) -> st
 
 def handle_start_command(chat_id: int, message_id: int):
     """处理 /start 命令"""
-    welcome_message = """
-👋 **欢迎使用 Jira BUG 提交助手！**
+    welcome_message = """👋 欢迎使用 Jira BUG 提交助手！
 
-🎯 **我能做什么：**
+🎯 我能做什么：
 • 帮你分析和提交 BUG 到 Jira
 • 支持截图识别，自动分析界面问题
 • 搜索已有的 Issue
 • 查看 Issue 详情
 
-📝 **如何使用：**
+📝 如何使用：
 在群里 @我 并描述你遇到的问题，例如：
-`@jira9527bot 登录页面点击按钮没有反应`
+@jira9527bot 登录页面点击按钮没有反应
 
-📷 **支持截图：**
+📷 支持截图：
 发送截图并 @我 描述问题，我会自动分析截图内容！
 
-💡 **其他命令：**
+💡 其他命令：
 • /clear - 清除对话历史
 • /help - 查看帮助信息
 
-有问题随时 @我！
-"""
-    send_message(chat_id, welcome_message, message_id)
+有问题随时 @我！"""
+    send_message(chat_id, welcome_message, message_id, parse_mode=None)
 
 
 def handle_help_command(chat_id: int, message_id: int):
     """处理 /help 命令"""
-    help_message = """
-📖 **使用帮助**
+    help_message = """📖 使用帮助
 
-**报告 BUG：**
+报告 BUG：
 @我并描述问题，我会帮你分析并创建 Jira Issue。
 
-**支持截图：**
+支持截图：
 发送截图并 @我 描述问题，我会自动分析截图内容并创建 Issue。
 
-**示例：**
-• `@jira9527bot 首页加载很慢，需要5秒以上`
-• `@jira9527bot 用户头像显示不出来，一直是默认图片`
-• 发送截图 + `@jira9527bot 这个按钮点击没反应`
+示例：
+• @jira9527bot 首页加载很慢，需要5秒以上
+• @jira9527bot 用户头像显示不出来，一直是默认图片
+• 发送截图 + @jira9527bot 这个按钮点击没反应
 
-**搜索 Issue：**
-• `@jira9527bot 搜索登录相关的问题`
-• `@jira9527bot 查看 BB-123 的详情`
+搜索 Issue：
+• @jira9527bot 搜索登录相关的问题
+• @jira9527bot 查看 BB-123 的详情
 
-**其他命令：**
+其他命令：
 • /clear - 清除对话历史，开始新对话
-• /start - 查看欢迎信息
-"""
-    send_message(chat_id, help_message, message_id)
+• /start - 查看欢迎信息"""
+    send_message(chat_id, help_message, message_id, parse_mode=None)
 
 
 def handle_clear_command(chat_id: int, message_id: int, user_id: int):
     """处理 /clear 命令"""
     clear_user_session(user_id)
-    send_message(chat_id, "✅ 对话历史已清除，我们可以开始新的对话了！", message_id)
+    send_message(chat_id, "✅ 对话历史已清除，我们可以开始新的对话了！", message_id, parse_mode=None)
 
 
-def handle_user_message(chat_id: int, message_id: int, user_id: int, text: str, photo_file_id: str = None):
-    """处理用户消息"""
-    bot_username = get_bot_username()
-    
-    # 只在被 @ 时触发
-    if not bot_username or f"@{bot_username}" not in text:
-        return
-    
-    user_message = text.replace(f"@{bot_username}", "").strip()
-    
-    if not user_message and not photo_file_id:
-        send_message(chat_id, "请告诉我你遇到了什么问题？可以附上截图。", message_id)
-        return
-    
-    # 发送"正在处理"提示
-    if photo_file_id:
-        processing_result = send_message(chat_id, "🖼️ 正在分析截图和问题...", message_id)
-    else:
-        processing_result = send_message(chat_id, "🤔 正在分析你的问题...", message_id)
-    
-    processing_msg_id = processing_result.get("result", {}).get("message_id") if processing_result.get("ok") else None
+def process_message_async(chat_id: int, message_id: int, user_id: int, text: str, photo_file_id: str = None):
+    """异步处理用户消息"""
+    processing_msg_id = None
     
     try:
+        bot_username = get_bot_username()
+        
+        # 只在被 @ 时触发
+        if not bot_username or f"@{bot_username}" not in text:
+            return
+        
+        user_message = text.replace(f"@{bot_username}", "").strip()
+        
+        if not user_message and not photo_file_id:
+            send_message(chat_id, "请告诉我你遇到了什么问题？可以附上截图。", message_id, parse_mode=None)
+            return
+        
+        # 发送"正在处理"提示
+        if photo_file_id:
+            processing_result = send_message(chat_id, "🖼️ 正在分析截图和问题...", message_id, parse_mode=None)
+        else:
+            processing_result = send_message(chat_id, "🤔 正在分析你的问题...", message_id, parse_mode=None)
+        
+        processing_msg_id = processing_result.get("result", {}).get("message_id") if processing_result.get("ok") else None
+        
         image_analysis = None
         
         # 如果有图片，下载并分析
@@ -690,7 +742,18 @@ def handle_user_message(chat_id: int, message_id: int, user_id: int, text: str, 
         if processing_msg_id:
             delete_message(chat_id, processing_msg_id)
         
-        send_message(chat_id, f"❌ 处理失败：{error_message}", message_id)
+        send_message(chat_id, f"❌ 处理失败：{error_message}", message_id, parse_mode=None)
+
+
+def handle_user_message(chat_id: int, message_id: int, user_id: int, text: str, photo_file_id: str = None):
+    """处理用户消息 - 启动异步处理线程"""
+    # 在后台线程中处理消息
+    thread = threading.Thread(
+        target=process_message_async,
+        args=(chat_id, message_id, user_id, text, photo_file_id)
+    )
+    thread.daemon = True
+    thread.start()
 
 
 # ============================================================
@@ -700,7 +763,7 @@ def handle_user_message(chat_id: int, message_id: int, user_id: int, text: str, 
 @app.route('/', methods=['GET'])
 def health_check():
     """健康检查端点"""
-    return 'OK - Telegram Jira Agent Bot with Vision is running (Pure Webhook Mode)'
+    return 'OK - Telegram Jira Agent Bot with Vision is running (Pure Webhook Mode v2)'
 
 
 @app.route('/webhook', methods=['POST'])
@@ -708,7 +771,14 @@ def webhook():
     """Webhook 端点，接收 Telegram 更新"""
     try:
         update = request.get_json(force=True)
-        print(f"Received update: {json.dumps(update, ensure_ascii=False)[:500]}")
+        update_id = update.get("update_id")
+        
+        # 消息去重检查
+        if update_id and message_cache.is_duplicate(update_id):
+            print(f"Duplicate update_id: {update_id}, skipping...")
+            return Response('OK', status=200)
+        
+        print(f"Processing update_id: {update_id}")
         
         message = update.get("message")
         if not message:
@@ -735,13 +805,15 @@ def webhook():
             
             handle_user_message(chat_id, message_id, user_id, text, photo_file_id)
         
+        # 立即返回 200，让 Telegram 知道我们已收到消息
         return Response('OK', status=200)
         
     except Exception as e:
         print(f"Webhook error: {e}")
         import traceback
         traceback.print_exc()
-        return Response('Error', status=500)
+        # 即使出错也返回 200，避免 Telegram 重试
+        return Response('OK', status=200)
 
 
 def setup_webhook():
@@ -772,9 +844,13 @@ def setup_webhook():
 # ============================================================
 
 if __name__ == "__main__":
-    print("Starting Jira Agent Bot in Pure Webhook Mode...")
+    print("Starting Jira Agent Bot in Pure Webhook Mode v2...")
     print(f"WEBHOOK_URL: {WEBHOOK_URL}")
     print(f"PORT: {PORT}")
+    
+    # 预热机器人用户名缓存
+    bot_username = get_bot_username()
+    print(f"Bot username: {bot_username}")
     
     # 设置 Webhook
     if setup_webhook():
@@ -784,4 +860,4 @@ if __name__ == "__main__":
     
     # 启动 Flask 服务器
     print(f"Starting Flask server on port {PORT}...")
-    app.run(host='0.0.0.0', port=PORT, debug=False)
+    app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
