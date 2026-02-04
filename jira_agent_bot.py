@@ -190,17 +190,38 @@ def create_jira_issue(title: str, description: str, bug_type: str) -> dict:
         if len(title) > 250:
             title = title[:247] + "..."
         
-        # 将描述按换行符分割成多个段落
+        # 将描述按换行符分割成多个段落，并限制长度
+        # Jira 对 ADF 内容有限制，每个段落不能太长，总段落数也有限制
+        MAX_PARA_LENGTH = 2000  # 每个段落最大字符数
+        MAX_PARAGRAPHS = 50  # 最大段落数
+        MAX_TOTAL_LENGTH = 30000  # 总描述最大字符数
+        
+        # 先截断总长度
+        if len(description) > MAX_TOTAL_LENGTH:
+            description = description[:MAX_TOTAL_LENGTH] + "\n\n[描述已截断...]" 
+        
         paragraphs = description.split('\n')
         content_blocks = []
         for para in paragraphs:
             if para.strip():  # 跳过空行
+                # 截断过长的段落
+                if len(para) > MAX_PARA_LENGTH:
+                    para = para[:MAX_PARA_LENGTH] + "..."
                 content_blocks.append({
                     "type": "paragraph",
                     "content": [
                         {"type": "text", "text": para}
                     ]
                 })
+                # 限制段落数量
+                if len(content_blocks) >= MAX_PARAGRAPHS:
+                    content_blocks.append({
+                        "type": "paragraph",
+                        "content": [
+                            {"type": "text", "text": "[更多内容已省略...]"}
+                        ]
+                    })
+                    break
 
         payload = {
             "fields": {
