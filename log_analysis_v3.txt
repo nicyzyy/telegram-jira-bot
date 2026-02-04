@@ -1,0 +1,19 @@
+# 日志分析 - v3 版本问题
+
+## 观察到的问题
+1. 10:08:00 PM 收到一个 POST /webhook 请求，返回 200
+2. 但是没有看到任何处理日志（如 "Processing update_id", "Received update" 等）
+3. 这意味着消息被接收了，但没有被处理
+
+## 可能的原因
+1. 消息被去重机制误判为重复消息
+2. 消息没有被正确解析
+3. 消息中没有 @bot 或者 bot_username 检测失败
+
+## 需要检查的代码
+1. message_cache.is_duplicate() 是否误判
+2. webhook() 函数中的消息解析逻辑
+3. bot_username 缓存是否正确
+
+## 解决方案
+需要添加更多调试日志来定位问题

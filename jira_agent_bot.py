@@ -734,10 +734,14 @@ def process_message_async(chat_id: int, message_id: int, user_id: int, text: str
     status_msg_id = None
     
     try:
+        print(f"[Async] Starting to process message: text='{text[:50]}...', photo={photo_file_id is not None}")
+        
         bot_username = get_bot_username()
+        print(f"[Async] Bot username: {bot_username}")
         
         # 只在被 @ 时触发
         if not bot_username or f"@{bot_username}" not in text:
+            print(f"[Async] Message does not mention bot, skipping. Looking for '@{bot_username}' in '{text}'")
             return
         
         user_message = text.replace(f"@{bot_username}", "").strip()
@@ -850,6 +854,8 @@ def webhook():
         update = request.get_json(force=True)
         update_id = update.get("update_id")
         
+        print(f"Received webhook update: {str(update)[:200]}...")
+        
         # 消息去重检查
         if update_id and message_cache.is_duplicate(update_id):
             print(f"Duplicate update_id: {update_id}, skipping...")
@@ -859,12 +865,16 @@ def webhook():
         
         message = update.get("message")
         if not message:
+            print("No message in update, skipping...")
             return Response('OK', status=200)
         
         chat_id = message.get("chat", {}).get("id")
         message_id = message.get("message_id")
         user_id = message.get("from", {}).get("id")
         text = message.get("text") or message.get("caption") or ""
+        has_photo = bool(message.get("photo"))
+        
+        print(f"Message from chat {chat_id}, user {user_id}: text='{text[:50]}...', has_photo={has_photo}")
         
         # 处理命令
         if text.startswith("/start"):
