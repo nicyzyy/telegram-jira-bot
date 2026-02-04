@@ -54,7 +54,7 @@ JSON格式要求：
 用户报告：
 {text}"""
     data = {
-        "model": "gpt-4o-mini",
+        "model": "gpt-5.2",
         "messages": [{"role": "user", "content": prompt}],
         "response_format": {"type": "json_object"}
     }
