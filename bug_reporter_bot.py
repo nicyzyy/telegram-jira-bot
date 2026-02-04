@@ -1,8 +1,8 @@
-
-
 import os
 import json
 import requests
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -13,10 +13,27 @@ JIRA_DOMAIN = os.getenv("JIRA_DOMAIN")
 JIRA_EMAIL = os.getenv("JIRA_EMAIL")
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 JIRA_PROJECT_KEY = "BB"
+PORT = int(os.getenv("PORT", 10000))
 
 # --- Assignee IDs ---
 ASSIGNEE_DEV = "712020:29364cb3-1ba1-453c-8e28-4e0306787939"
 ASSIGNEE_UI = "712020:7b0eae8d-9cc3-406b-814e-bbbe51c67cbd"
+
+# --- Health Check HTTP Server ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'OK - Telegram Jira Bot is running')
+    
+    def log_message(self, format, *args):
+        pass  # Suppress logging
+
+def start_health_server():
+    server = HTTPServer(('0.0.0.0', PORT), HealthCheckHandler)
+    print(f"Health check server running on port {PORT}")
+    server.serve_forever()
 
 # --- OpenAI Function ---
 def analyze_bug_report(text):
@@ -24,9 +41,19 @@ def analyze_bug_report(text):
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json"
     }
-    prompt = f"""你是一个BUG分析助手。请分析以下用户报告的BUG信息，并以JSON格式返回结果。\n\nJSON格式要求：\n{{\n  \"bug_title\": \"BUG标题\",\n  \"bug_description\": \"BUG详细描述\",\n  \"bug_type\": \"开发BUG 或 UI/设计BUG\"\n}}\n\n用户报告：\n{text}"""
+    prompt = f"""你是一个BUG分析助手。请分析以下用户报告的BUG信息，并以JSON格式返回结果。
+
+JSON格式要求：
+{{
+  "bug_title": "BUG标题",
+  "bug_description": "BUG详细描述",
+  "bug_type": "开发BUG 或 UI/设计BUG"
+}}
+
+用户报告：
+{text}"""
     data = {
-        "model": "chatgpt-5.2",
+        "model": "gpt-4o-mini",
         "messages": [{"role": "user", "content": prompt}],
         "response_format": {"type": "json_object"}
     }
@@ -75,18 +102,28 @@ def create_jira_issue(bug_data):
 
 # --- Telegram Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("你好！我是BUG上报机器人。请直接在群里@我并描述BUG详情。")
+    await update.message.reply_text("你好！我是BUG上报机器人。请直接在群里@我并描述BUG详情，或者直接发送消息给我。")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
-    # 检查是否 @机器人
+    # 获取机器人用户名
     bot_username = (await context.bot.get_me()).username
-    if f"@{bot_username}" not in update.message.text:
+    
+    # 检查是否是私聊或者在群里@机器人
+    is_private_chat = update.message.chat.type == "private"
+    is_mentioned = f"@{bot_username}" in update.message.text
+    
+    if not is_private_chat and not is_mentioned:
         return
 
     user_report = update.message.text.replace(f"@{bot_username}", "").strip()
+    
+    if not user_report:
+        await update.message.reply_text("请描述你遇到的BUG问题。")
+        return
+    
     await update.message.reply_text("正在分析BUG，请稍候...")
 
     try:
@@ -102,24 +139,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 3. Send Confirmation
         confirmation_message = (
             f"✅ BUG已成功提交到Jira！\n\n"
-            f"📋 **BUG信息**：\n"
-            f"**标题**：{bug_data.get('bug_title')}\n"
-            f"**类型**：{bug_data.get('bug_type')}\n\n"
-            f"🔗 **Jira链接**：{issue_url}"
+            f"📋 BUG信息：\n"
+            f"标题：{bug_data.get('bug_title')}\n"
+            f"类型：{bug_data.get('bug_type')}\n\n"
+            f"🔗 Jira链接：{issue_url}"
         )
-        await update.message.reply_text(confirmation_message, parse_mode='Markdown')
+        await update.message.reply_text(confirmation_message)
 
     except Exception as e:
-        await update.message.reply_text(f"处理失败，发生错误：\n{str(e)}")
+        error_message = str(e)
+        print(f"Error: {error_message}")
+        await update.message.reply_text(f"处理失败，发生错误：\n{error_message}")
 
 # --- Main Function ---
 def main():
+    # Start health check server in a separate thread
+    health_thread = threading.Thread(target=start_health_server, daemon=True)
+    health_thread.start()
+    
+    # Start Telegram bot
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Bot is running...")
+    print("Telegram Bot is running...")
     application.run_polling()
 
 if __name__ == "__main__":
