@@ -828,8 +828,11 @@ def handle_user_message(chat_id: int, message_id: int, user_id: int, text: str, 
     """处理用户消息 - 先发送即时反馈，然后启动异步处理线程"""
     # 检查是否 @ 了机器人
     bot_username = get_bot_username()
+    logger.info(f"Checking bot mention: bot_username={bot_username}, text contains @{bot_username}: {f'@{bot_username}' in text if bot_username else 'N/A'}")
+    
     if not bot_username or f"@{bot_username}" not in text:
         # 没有 @ 机器人，不处理
+        logger.info(f"Message does not mention bot, skipping immediate feedback")
         return
     
     # 立即发送确认消息（在主线程中）
@@ -838,10 +841,17 @@ def handle_user_message(chat_id: int, message_id: int, user_id: int, text: str, 
     else:
         status_text = "📝 收到问题，正在分析..."
     
+    logger.info(f"Sending immediate feedback to chat {chat_id}, reply_to {message_id}")
     status_result = send_message(chat_id, status_text, message_id, parse_mode=None)
-    status_msg_id = status_result.get("result", {}).get("message_id") if status_result.get("ok") else None
+    logger.info(f"Immediate feedback result: {status_result}")
     
-    logger.info(f"Sent immediate feedback, status_msg_id: {status_msg_id}")
+    status_msg_id = None
+    if status_result.get("ok"):
+        status_msg_id = status_result.get("result", {}).get("message_id")
+        logger.info(f"Immediate feedback sent successfully, status_msg_id: {status_msg_id}")
+    else:
+        logger.error(f"Failed to send immediate feedback: {status_result}")
+        # 即使发送失败也继续处理，只是没有状态消息可更新
     
     # 在后台线程中处理消息
     thread = threading.Thread(
