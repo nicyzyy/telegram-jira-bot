@@ -26,7 +26,7 @@ def analyze_bug_report(text):
     }
     prompt = f"""你是一个BUG分析助手。请分析以下用户报告的BUG信息，并以JSON格式返回结果。\n\nJSON格式要求：\n{{\n  \"bug_title\": \"BUG标题\",\n  \"bug_description\": \"BUG详细描述\",\n  \"bug_type\": \"开发BUG 或 UI/设计BUG\"\n}}\n\n用户报告：\n{text}"""
     data = {
-        "model": "gpt-4o-mini",
+        "model": "chatgpt-5.2",
         "messages": [{"role": "user", "content": prompt}],
         "response_format": {"type": "json_object"}
     }
