@@ -1,15 +1,15 @@
 """
-Telegram Jira Bot - Multi-Agent Architecture with Vision Support
+Telegram Jira Bot - Multi-Agent Architecture with Vision Support (Webhook Mode)
 使用 OpenAI Function Calling 和 Vision API 实现的 BUG 提交机器人
+采用 Webhook 模式提高稳定性
 """
 import os
 import json
 import asyncio
-import threading
 import requests
 import base64
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from telegram import Update
+from flask import Flask, request, Response
+from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from openai import OpenAI
 
@@ -22,6 +22,7 @@ JIRA_EMAIL = os.getenv("JIRA_EMAIL")
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 JIRA_PROJECT_KEY = os.getenv("JIRA_PROJECT_KEY", "BB")
 PORT = int(os.getenv("PORT", 10000))
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # e.g., https://telegram-jira-bot-29j8.onrender.com
 
 # --- Assignee IDs ---
 ASSIGNEE_DEV = "712020:29364cb3-1ba1-453c-8e28-4e0306787939"
@@ -30,31 +31,24 @@ ASSIGNEE_UI = "712020:7b0eae8d-9cc3-406b-814e-bbbe51c67cbd"
 # --- OpenAI Client ---
 client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_API_BASE) if OPENAI_API_BASE else OpenAI(api_key=OPENAI_API_KEY)
 
-# --- Health Check HTTP Server ---
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
-        self.end_headers()
-        self.wfile.write(b'OK - Telegram Jira Agent Bot with Vision is running')
-    
-    def log_message(self, format, *args):
-        pass
+# --- Flask App for Webhook ---
+app = Flask(__name__)
 
-def start_health_server():
-    server = HTTPServer(('0.0.0.0', PORT), HealthCheckHandler)
-    print(f"Health check server running on port {PORT}")
-    server.serve_forever()
+# --- Global Application ---
+application = None
 
 
 # ============================================================
-# 图片处理函数
+# Vision API Functions
 # ============================================================
 
-async def download_telegram_photo(bot, file_id: str) -> tuple:
-    """
-    下载 Telegram 图片并返回 (图片字节数据, 文件名)
-    """
+def encode_image_to_base64(image_bytes: bytes) -> str:
+    """将图片字节转换为 base64 字符串"""
+    return base64.b64encode(image_bytes).decode('utf-8')
+
+
+async def download_telegram_photo(bot: Bot, file_id: str) -> tuple:
+    """下载 Telegram 图片"""
     try:
         file = await bot.get_file(file_id)
         file_path = file.file_path
@@ -63,18 +57,16 @@ async def download_telegram_photo(bot, file_id: str) -> tuple:
         
         # 检查 file_path 是否已经是完整 URL
         if file_path.startswith("http"):
-            file_url = file_path
+            download_url = file_path
         else:
-            file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+            download_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
         
-        print(f"Downloading from: {file_url}")
+        print(f"Downloading from: {download_url}")
         
-        response = requests.get(file_url)
+        response = requests.get(download_url)
         response.raise_for_status()
         
-        # 获取文件名
-        filename = file_path.split("/")[-1] if "/" in file_path else f"image_{file_id}.jpg"
-        
+        filename = file_path.split('/')[-1] if '/' in file_path else f"photo_{file_id}.jpg"
         print(f"Photo downloaded successfully: {filename}, size: {len(response.content)} bytes")
         
         return response.content, filename
@@ -85,15 +77,8 @@ async def download_telegram_photo(bot, file_id: str) -> tuple:
         return None, None
 
 
-def encode_image_to_base64(image_bytes: bytes) -> str:
-    """将图片字节数据编码为 base64"""
-    return base64.b64encode(image_bytes).decode('utf-8')
-
-
 def analyze_image_with_vision(image_base64: str, user_text: str) -> str:
-    """
-    使用 OpenAI Vision API 分析图片
-    """
+    """使用 OpenAI Vision API 分析图片"""
     try:
         print("Calling Vision API to analyze image...")
         
@@ -136,42 +121,13 @@ def analyze_image_with_vision(image_base64: str, user_text: str) -> str:
         return analysis
         
     except Exception as e:
-        print(f"Error analyzing image with Vision API: {e}")
-        import traceback
-        traceback.print_exc()
-        return f"截图分析失败（{str(e)}）"
-
-
-def upload_attachment_to_jira(issue_key: str, image_bytes: bytes, filename: str) -> dict:
-    """
-    上传附件到 Jira Issue
-    """
-    try:
-        url = f"https://{JIRA_DOMAIN}/rest/api/3/issue/{issue_key}/attachments"
-        auth = (JIRA_EMAIL, JIRA_API_TOKEN)
-        headers = {
-            "Accept": "application/json",
-            "X-Atlassian-Token": "no-check"
-        }
-        
-        files = {
-            'file': (filename, image_bytes, 'image/jpeg')
-        }
-        
-        response = requests.post(url, headers=headers, auth=auth, files=files)
-        response.raise_for_status()
-        
-        result = response.json()
-        print(f"Attachment uploaded successfully: {result}")
-        return {"success": True, "attachment": result}
-        
-    except Exception as e:
-        print(f"Error uploading attachment: {e}")
-        return {"success": False, "error": str(e)}
+        error_msg = f"图片分析失败：{str(e)}"
+        print(error_msg)
+        return error_msg
 
 
 # ============================================================
-# Jira 工具函数
+# Jira API Functions
 # ============================================================
 
 def create_jira_issue(title: str, description: str, bug_type: str) -> dict:
@@ -191,20 +147,17 @@ def create_jira_issue(title: str, description: str, bug_type: str) -> dict:
             title = title[:247] + "..."
         
         # 将描述按换行符分割成多个段落，并限制长度
-        # Jira 对 ADF 内容有限制，每个段落不能太长，总段落数也有限制
-        MAX_PARA_LENGTH = 2000  # 每个段落最大字符数
-        MAX_PARAGRAPHS = 50  # 最大段落数
-        MAX_TOTAL_LENGTH = 30000  # 总描述最大字符数
+        MAX_PARA_LENGTH = 2000
+        MAX_PARAGRAPHS = 50
+        MAX_TOTAL_LENGTH = 30000
         
-        # 先截断总长度
         if len(description) > MAX_TOTAL_LENGTH:
             description = description[:MAX_TOTAL_LENGTH] + "\n\n[描述已截断...]" 
         
         paragraphs = description.split('\n')
         content_blocks = []
         for para in paragraphs:
-            if para.strip():  # 跳过空行
-                # 截断过长的段落
+            if para.strip():
                 if len(para) > MAX_PARA_LENGTH:
                     para = para[:MAX_PARA_LENGTH] + "..."
                 content_blocks.append({
@@ -213,7 +166,6 @@ def create_jira_issue(title: str, description: str, bug_type: str) -> dict:
                         {"type": "text", "text": para}
                     ]
                 })
-                # 限制段落数量
                 if len(content_blocks) >= MAX_PARAGRAPHS:
                     content_blocks.append({
                         "type": "paragraph",
@@ -269,6 +221,32 @@ def create_jira_issue(title: str, description: str, bug_type: str) -> dict:
         return {"success": False, "error": str(e)}
 
 
+def upload_attachment_to_jira(issue_key: str, image_bytes: bytes, filename: str) -> dict:
+    """上传附件到 Jira Issue"""
+    try:
+        url = f"https://{JIRA_DOMAIN}/rest/api/3/issue/{issue_key}/attachments"
+        auth = (JIRA_EMAIL, JIRA_API_TOKEN)
+        headers = {
+            "Accept": "application/json",
+            "X-Atlassian-Token": "no-check"
+        }
+        
+        files = {
+            "file": (filename, image_bytes, "image/jpeg")
+        }
+        
+        print(f"Uploading attachment to {issue_key}...")
+        response = requests.post(url, headers=headers, auth=auth, files=files)
+        response.raise_for_status()
+        
+        print(f"Attachment uploaded successfully to {issue_key}")
+        return {"success": True, "result": response.json()}
+        
+    except Exception as e:
+        print(f"Attachment upload error: {e}")
+        return {"success": False, "error": str(e)}
+
+
 def search_jira_issues(query: str) -> dict:
     """搜索 Jira Issues"""
     try:
@@ -276,29 +254,28 @@ def search_jira_issues(query: str) -> dict:
         auth = (JIRA_EMAIL, JIRA_API_TOKEN)
         headers = {"Accept": "application/json", "Content-Type": "application/json"}
         
-        jql = f'project = {JIRA_PROJECT_KEY} AND text ~ "{query}" ORDER BY created DESC'
-        params = {"jql": jql, "maxResults": 5, "fields": ["summary", "status", "created"]}
+        jql = f'project = {JIRA_PROJECT_KEY} AND (summary ~ "{query}" OR description ~ "{query}") ORDER BY created DESC'
+        payload = {"jql": jql, "maxResults": 5, "fields": ["summary", "status", "created", "assignee"]}
         
-        response = requests.get(url, headers=headers, auth=auth, params=params)
+        response = requests.post(url, headers=headers, auth=auth, data=json.dumps(payload))
         response.raise_for_status()
-        result = response.json()
         
-        issues = []
-        for issue in result.get("issues", []):
-            issues.append({
+        issues = response.json().get("issues", [])
+        results = []
+        for issue in issues:
+            results.append({
                 "key": issue["key"],
                 "summary": issue["fields"]["summary"],
                 "status": issue["fields"]["status"]["name"],
                 "url": f"https://{JIRA_DOMAIN}/browse/{issue['key']}"
             })
         
-        return {"success": True, "count": len(issues), "issues": issues}
-        
+        return {"success": True, "issues": results, "count": len(results)}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
-def get_jira_issue_detail(issue_key: str) -> dict:
+def get_jira_issue(issue_key: str) -> dict:
     """获取 Jira Issue 详情"""
     try:
         url = f"https://{JIRA_DOMAIN}/rest/api/3/issue/{issue_key}"
@@ -307,48 +284,72 @@ def get_jira_issue_detail(issue_key: str) -> dict:
         
         response = requests.get(url, headers=headers, auth=auth)
         response.raise_for_status()
-        issue = response.json()
         
+        issue = response.json()
         return {
             "success": True,
             "key": issue["key"],
             "summary": issue["fields"]["summary"],
             "status": issue["fields"]["status"]["name"],
-            "assignee": issue["fields"].get("assignee", {}).get("displayName", "未分配"),
-            "created": issue["fields"]["created"],
             "url": f"https://{JIRA_DOMAIN}/browse/{issue['key']}"
         }
-        
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
 # ============================================================
-# OpenAI Function Calling 定义
+# Agent System
 # ============================================================
+
+# 用户会话存储
+user_sessions = {}
+pending_images = {}
+
+SYSTEM_PROMPT = """你是一位资深的 QA 工程师和产品专家，专门帮助用户高效提交 BUG 到 Jira。
+
+## 核心原则
+1. **一次完成**：尽量从用户描述中提取所有信息，不要反复追问
+2. **专业分析**：为每个 BUG 提供技术根因分析
+3. **修复建议**：给出具体可行的修复方向
+
+## 工作流程
+当用户报告问题时：
+1. 快速理解问题本质
+2. 自动补全缺失信息（基于经验推断）
+3. 生成专业的 BUG 标题和描述
+4. 直接调用工具创建 Jira Issue
+
+## BUG 分类标准
+- **开发BUG**：功能异常、逻辑错误、接口问题、性能问题、数据问题
+- **UI/设计BUG**：样式问题、布局问题、动效问题、视觉不一致
+
+## 描述模板
+【问题描述】简明扼要描述问题现象
+【复现步骤】1. 2. 3.
+【预期结果】应该怎样
+【实际结果】实际怎样
+【影响范围】影响哪些用户/场景
+【技术分析】可能的技术原因
+【修复建议】建议的修复方向
+
+## 注意事项
+- 标题要简洁有力，包含模块名和问题关键词
+- 如果用户提供了截图分析，要在描述中引用
+- 不要问用户"还需要补充什么"，直接创建
+- 创建成功后给出简洁的确认信息"""
 
 TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "create_jira_issue",
-            "description": "创建一个新的 Jira Issue（BUG）。在收集到足够的信息后调用此函数。",
+            "description": "创建 Jira BUG Issue。当用户报告了一个问题或 BUG 时调用此工具。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "title": {
-                        "type": "string",
-                        "description": "BUG 标题，简洁明了地描述问题"
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "BUG 详细描述，包含复现步骤、预期结果、实际结果等"
-                    },
-                    "bug_type": {
-                        "type": "string",
-                        "enum": ["开发BUG", "UI/设计BUG"],
-                        "description": "BUG 类型：开发BUG（功能问题）或 UI/设计BUG（界面问题）"
-                    }
+                    "title": {"type": "string", "description": "Issue 标题，简洁描述问题"},
+                    "description": {"type": "string", "description": "详细的问题描述，包含复现步骤、预期结果、实际结果等"},
+                    "bug_type": {"type": "string", "enum": ["开发BUG", "UI/设计BUG"], "description": "BUG 类型"}
                 },
                 "required": ["title", "description", "bug_type"]
             }
@@ -362,10 +363,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "搜索关键词"
-                    }
+                    "query": {"type": "string", "description": "搜索关键词"}
                 },
                 "required": ["query"]
             }
@@ -374,15 +372,12 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "get_jira_issue_detail",
-            "description": "获取特定 Jira Issue 的详细信息",
+            "name": "get_jira_issue",
+            "description": "获取指定 Jira Issue 的详情",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "issue_key": {
-                        "type": "string",
-                        "description": "Issue 编号，如 BB-123"
-                    }
+                    "issue_key": {"type": "string", "description": "Issue 编号，如 BB-123"}
                 },
                 "required": ["issue_key"]
             }
@@ -390,197 +385,88 @@ TOOLS = [
     }
 ]
 
-SYSTEM_PROMPT = """
-你是一位资深的软件质量工程师和 BUG 分析专家，名叫 "Jira小助手"。你拥有丰富的软件开发和测试经验，能够快速理解问题本质，精准定位 BUG 根因，并提供专业的修复建议。
-
-## 核心原则
-
-1. **一次完成**：从用户的简短描述中提取所有信息，直接创建 Issue，不反复追问
-2. **专业补全**：基于你的专业经验，自动推断和补充缺失的技术细节
-3. **提供价值**：每次回复都包含专业的问题分析和修复建议
-4. **高效简洁**：用户的时间很宝贵，快速响应，一次交互解决问题
-
-## 工作流程
-
-### 当用户报告 BUG 时：
-
-**立即执行以下步骤，不要询问用户：**
-
-1. **智能分析**：从用户描述中提取问题现象、影响范围、触发条件
-2. **专业补全**：自动推断复现步骤、预期/实际结果、技术根因
-3. **直接创建**：立即调用 create_jira_issue，不需要用户确认
-4. **反馈结果**：展示创建结果 + 专业分析 + 修复建议
-
-### BUG 描述格式
-
-创建 Issue 时，description 必须包含以下结构化内容：
-
-```
-【问题描述】
-{用户报告的问题现象}
-
-【截图分析】
-{如果有截图分析结果，在这里展示}
-
-【复现步骤】
-1. {步骤1}
-2. {步骤2}
-3. {步骤3}
-
-【预期结果】
-{应该发生什么}
-
-【实际结果】
-{实际发生了什么}
-
-【影响范围】
-{受影响的功能/用户群体}
-
-【技术分析】
-{可能的根因分析}
-
-【修复建议】
-{建议的解决方向}
-```
-
-### BUG 类型判断
-
-- **开发BUG**：功能逻辑错误、接口问题、数据异常、崩溃、性能问题、网络请求失败
-- **UI/设计BUG**：界面显示问题、交互体验问题、样式错误、动效缺失、布局异常
-
-## 回复格式
-
-创建成功后，按以下格式回复：
-
-```
-✅ BUG 已提交到 Jira！
-
-📋 **Issue 信息**
-• 编号：{issue_key}
-• 标题：{title}
-• 类型：{bug_type}
-
-🔍 **问题分析**
-{你对问题根因的专业分析，2-3句话}
-
-💡 **修复建议**
-{给开发团队的修复方向建议，2-3句话}
-
-🔗 {issue_url}
-```
-
-## 重要禁止事项
-
-❌ 不要问用户"能否提供更多信息？"
-❌ 不要问用户"确定要创建吗？"
-❌ 不要问用户"这是什么类型的问题？"
-❌ 不要进行多轮对话来收集信息
-❌ 不要只是简单记录问题，要提供专业分析
-
-## 示例
-
-**用户输入**："登录按钮点不动"
-
-**你应该**：
-1. 直接创建 Issue
-2. 标题："登录页面-登录按钮点击无响应"
-3. 自动补全完整的描述（复现步骤、预期/实际结果等）
-4. 技术分析："可能原因：1）按钮事件绑定丢失；2）JS执行报错阻断；3）网络请求阻塞UI线程"
-5. 修复建议："建议检查：1）按钮onClick事件绑定；2）浏览器控制台JS错误；3）登录接口响应状态"
-"""
-
-
-# ============================================================
-# Agent 核心逻辑
-# ============================================================
-
-# 用户会话存储
-user_sessions = {}
-# 存储待上传的图片
-pending_images = {}
 
 def get_user_session(user_id: int) -> list:
-    """获取用户的对话历史"""
+    """获取用户会话历史"""
     if user_id not in user_sessions:
         user_sessions[user_id] = []
     return user_sessions[user_id]
 
-def add_to_session(user_id: int, message: dict):
-    """添加消息到会话历史"""
+
+def add_to_session(user_id: int, role: str, content: str):
+    """添加消息到会话"""
     session = get_user_session(user_id)
-    session.append(message)
-    # 保留最近 20 条消息
+    session.append({"role": role, "content": content})
     if len(session) > 20:
-        user_sessions[user_id] = session[-20:]
+        session.pop(0)
+
 
 def clear_user_session(user_id: int):
     """清除用户会话"""
     if user_id in user_sessions:
-        del user_sessions[user_id]
-    if user_id in pending_images:
-        del pending_images[user_id]
+        user_sessions[user_id] = []
 
 
-def execute_tool(tool_name: str, arguments: dict, user_id: int = None) -> str:
-    """执行工具函数"""
+def execute_tool(tool_name: str, arguments: dict, user_id: int) -> str:
+    """执行工具调用"""
+    print(f"执行工具: {tool_name}, 参数: {arguments}")
+    
     if tool_name == "create_jira_issue":
         result = create_jira_issue(
-            title=arguments.get("title"),
-            description=arguments.get("description"),
-            bug_type=arguments.get("bug_type")
+            title=arguments.get("title", ""),
+            description=arguments.get("description", ""),
+            bug_type=arguments.get("bug_type", "开发BUG")
         )
         
-        # 如果创建成功且有待上传的图片，上传附件
-        if result.get("success") and user_id and user_id in pending_images:
-            issue_key = result.get("issue_key")
-            image_data = pending_images[user_id]
+        if result["success"]:
+            # 如果有待上传的图片，上传到 Jira
+            if user_id in pending_images:
+                image_data = pending_images[user_id]
+                upload_result = upload_attachment_to_jira(
+                    result["issue_key"],
+                    image_data["bytes"],
+                    image_data["filename"]
+                )
+                del pending_images[user_id]
+                
+                if upload_result["success"]:
+                    print(f"Attachment uploaded successfully to {result['issue_key']}")
             
-            print(f"Uploading attachment to {issue_key}...")
-            upload_result = upload_attachment_to_jira(
-                issue_key, 
-                image_data["bytes"], 
-                image_data["filename"]
-            )
-            
-            if upload_result.get("success"):
-                result["attachment_uploaded"] = True
-                print(f"Attachment uploaded successfully to {issue_key}")
-            else:
-                result["attachment_error"] = upload_result.get("error")
-                print(f"Failed to upload attachment: {upload_result.get('error')}")
-            
-            # 清除待上传的图片
-            del pending_images[user_id]
-            
-    elif tool_name == "search_jira_issues":
-        result = search_jira_issues(query=arguments.get("query"))
-    elif tool_name == "get_jira_issue_detail":
-        result = get_jira_issue_detail(issue_key=arguments.get("issue_key"))
-    else:
-        result = {"error": f"未知工具: {tool_name}"}
+            return f"✅ BUG 已提交到 Jira!\n\n📋 **Issue 信息**\n• 编号：{result['issue_key']}\n• 标题：{result['title']}\n• 类型：{result['bug_type']}\n\n🔗 {result['issue_url']}"
+        else:
+            return f"❌ Jira 创建失败：{result['error']}"
     
-    return json.dumps(result, ensure_ascii=False)
+    elif tool_name == "search_jira_issues":
+        result = search_jira_issues(arguments.get("query", ""))
+        if result["success"]:
+            if result["count"] == 0:
+                return "未找到相关 Issue"
+            issues_text = "\n".join([f"• [{i['key']}] {i['summary']} ({i['status']})" for i in result["issues"]])
+            return f"🔍 找到 {result['count']} 个相关 Issue:\n{issues_text}"
+        return f"搜索失败：{result['error']}"
+    
+    elif tool_name == "get_jira_issue":
+        result = get_jira_issue(arguments.get("issue_key", ""))
+        if result["success"]:
+            return f"📋 **{result['key']}**\n• 标题：{result['summary']}\n• 状态：{result['status']}\n• 链接：{result['url']}"
+        return f"获取失败：{result['error']}"
+    
+    return "未知工具"
 
 
 async def run_agent(user_id: int, user_message: str, image_analysis: str = None) -> str:
     """运行 Agent 处理用户消息"""
     
-    # 如果有图片分析结果，将其添加到用户消息中
+    # 构建完整的用户消息
+    full_message = user_message
     if image_analysis:
-        enhanced_message = f"{user_message}\n\n【截图分析结果】\n{image_analysis}"
-    else:
-        enhanced_message = user_message
+        full_message = f"{user_message}\n\n【截图分析】\n{image_analysis}"
     
-    # 添加用户消息到会话
-    add_to_session(user_id, {"role": "user", "content": enhanced_message})
+    add_to_session(user_id, "user", full_message)
     
-    # 构建消息列表
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages.extend(get_user_session(user_id))
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + get_user_session(user_id)
     
-    # 最多循环 5 次（防止无限循环）
-    for _ in range(5):
-        # 调用 OpenAI API
+    try:
         response = client.chat.completions.create(
             model="gpt-5.2",
             messages=messages,
@@ -590,53 +476,29 @@ async def run_agent(user_id: int, user_message: str, image_analysis: str = None)
         
         assistant_message = response.choices[0].message
         
-        # 如果没有工具调用，返回文本回复
-        if not assistant_message.tool_calls:
-            reply = assistant_message.content
-            add_to_session(user_id, {"role": "assistant", "content": reply})
-            return reply
-        
         # 处理工具调用
-        messages.append({
-            "role": "assistant",
-            "content": assistant_message.content,
-            "tool_calls": [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments
-                    }
-                }
-                for tc in assistant_message.tool_calls
-            ]
-        })
-        
-        # 执行每个工具调用
-        for tool_call in assistant_message.tool_calls:
-            tool_name = tool_call.function.name
-            arguments = json.loads(tool_call.function.arguments)
+        if assistant_message.tool_calls:
+            tool_results = []
+            for tool_call in assistant_message.tool_calls:
+                tool_name = tool_call.function.name
+                arguments = json.loads(tool_call.function.arguments)
+                result = execute_tool(tool_name, arguments, user_id)
+                tool_results.append(result)
             
-            print(f"执行工具: {tool_name}, 参数: {arguments}")
+            final_response = "\n\n".join(tool_results)
+            add_to_session(user_id, "assistant", final_response)
+            return final_response
+        else:
+            content = assistant_message.content or "我理解了你的问题，请提供更多细节。"
+            add_to_session(user_id, "assistant", content)
+            return content
             
-            tool_result = execute_tool(tool_name, arguments, user_id)
-            
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": tool_result
-            })
-    
-    # 如果循环结束还没有返回，返回最后的消息
-    final_response = client.chat.completions.create(
-        model="gpt-5.2",
-        messages=messages
-    )
-    
-    reply = final_response.choices[0].message.content
-    add_to_session(user_id, {"role": "assistant", "content": reply})
-    return reply
+    except Exception as e:
+        error_msg = f"处理失败：{str(e)}"
+        print(f"Agent error: {e}")
+        import traceback
+        traceback.print_exc()
+        return error_msg
 
 
 # ============================================================
@@ -646,7 +508,7 @@ async def run_agent(user_id: int, user_message: str, image_analysis: str = None)
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理 /start 命令"""
     welcome_message = """
-👋 你好！我是 **Jira小助手**，一个智能 BUG 管理机器人。
+👋 **欢迎使用 Jira BUG 提交助手！**
 
 🎯 **我能做什么：**
 • 帮你分析和提交 BUG 到 Jira
@@ -786,38 +648,108 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# Main Function
+# Webhook Routes
 # ============================================================
 
-def main():
-    # 启动健康检查服务器
-    health_thread = threading.Thread(target=start_health_server, daemon=True)
-    health_thread.start()
-    
-    # 删除现有 webhook 避免冲突
-    print("Deleting any existing webhook...")
-    delete_webhook_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true"
-    try:
-        response = requests.get(delete_webhook_url)
-        print(f"Webhook deleted: {response.json()}")
-    except Exception as e:
-        print(f"Warning: Could not delete webhook: {e}")
-    
-    # 创建 Telegram 应用
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+@app.route('/', methods=['GET'])
+def health_check():
+    """健康检查端点"""
+    return 'OK - Telegram Jira Agent Bot with Vision is running (Webhook Mode)'
 
-    # 添加处理器 - 注意：需要处理带图片的消息
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Webhook 端点，接收 Telegram 更新"""
+    global application
+    
+    if application is None:
+        return Response('Application not initialized', status=500)
+    
+    try:
+        update_data = request.get_json(force=True)
+        update = Update.de_json(update_data, application.bot)
+        
+        # 异步处理更新
+        asyncio.run(application.process_update(update))
+        
+        return Response('OK', status=200)
+    except Exception as e:
+        print(f"Webhook error: {e}")
+        import traceback
+        traceback.print_exc()
+        return Response('Error', status=500)
+
+
+def setup_webhook():
+    """设置 Telegram Webhook"""
+    if not WEBHOOK_URL:
+        print("Warning: WEBHOOK_URL not set, webhook will not be configured")
+        return False
+    
+    webhook_url = f"{WEBHOOK_URL}/webhook"
+    
+    # 先删除旧的 webhook
+    delete_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true"
+    try:
+        response = requests.get(delete_url)
+        print(f"Delete webhook response: {response.json()}")
+    except Exception as e:
+        print(f"Error deleting webhook: {e}")
+    
+    # 设置新的 webhook
+    set_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
+    payload = {
+        "url": webhook_url,
+        "drop_pending_updates": True,
+        "allowed_updates": ["message", "edited_message"]
+    }
+    
+    try:
+        response = requests.post(set_url, json=payload)
+        result = response.json()
+        print(f"Set webhook response: {result}")
+        return result.get("ok", False)
+    except Exception as e:
+        print(f"Error setting webhook: {e}")
+        return False
+
+
+def init_application():
+    """初始化 Telegram Application"""
+    global application
+    
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # 添加处理器
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("clear", clear_command))
-    # 处理文本消息
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    # 处理带图片的消息
     application.add_handler(MessageHandler(filters.PHOTO, handle_message))
+    
+    # 初始化 application
+    asyncio.get_event_loop().run_until_complete(application.initialize())
+    
+    print("Telegram Application initialized")
 
-    print("Jira Agent Bot with Vision Support is running...")
-    application.run_polling(drop_pending_updates=True)
 
+# ============================================================
+# Main
+# ============================================================
 
 if __name__ == "__main__":
-    main()
+    print("Starting Jira Agent Bot in Webhook Mode...")
+    
+    # 初始化 Telegram Application
+    init_application()
+    
+    # 设置 Webhook
+    if setup_webhook():
+        print("Webhook configured successfully")
+    else:
+        print("Warning: Webhook configuration failed or WEBHOOK_URL not set")
+    
+    # 启动 Flask 服务器
+    print(f"Starting Flask server on port {PORT}...")
+    app.run(host='0.0.0.0', port=PORT, debug=False)
+"""
