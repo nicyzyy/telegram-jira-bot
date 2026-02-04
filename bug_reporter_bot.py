@@ -53,7 +53,7 @@ JSON格式要求：
 用户报告：
 {text}"""
     data = {
-        "model": "gpt-4o-mini",
+        "model": "gpt-5.2",
         "messages": [{"role": "user", "content": prompt}],
         "response_format": {"type": "json_object"}
     }
@@ -102,7 +102,7 @@ def create_jira_issue(bug_data):
 
 # --- Telegram Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("你好！我是BUG上报机器人。请直接在群里@我并描述BUG详情，或者直接发送消息给我。")
+    await update.message.reply_text("你好！我是BUG上报机器人。请在群里@我并描述BUG详情，我会自动分析并提交到Jira。")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
@@ -111,11 +111,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 获取机器人用户名
     bot_username = (await context.bot.get_me()).username
     
-    # 检查是否是私聊或者在群里@机器人
-    is_private_chat = update.message.chat.type == "private"
+    # 只在被@时触发（群组和私聊都需要@机器人）
     is_mentioned = f"@{bot_username}" in update.message.text
     
-    if not is_private_chat and not is_mentioned:
+    if not is_mentioned:
         return
 
     user_report = update.message.text.replace(f"@{bot_username}", "").strip()
