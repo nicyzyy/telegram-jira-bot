@@ -5,14 +5,27 @@ Telegram Jira Bot - Multi-Agent Architecture with Vision Support (Pure Webhook M
 v3: 优化用户体验 - 即时反馈 + 精简回复
 """
 import os
+import sys
 import json
 import requests
 import base64
 import threading
 import time
+import logging
 from collections import OrderedDict
 from flask import Flask, request, Response
 from openai import OpenAI
+
+# 配置 logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
+)
+logger = logging.getLogger(__name__)
+
+# 确保 stdout 不缓冲
+os.environ['PYTHONUNBUFFERED'] = '1'
 
 # --- Environment Variables ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -96,7 +109,7 @@ def telegram_api(method: str, data: dict = None) -> dict:
             response = requests.get(url, timeout=30)
         return response.json()
     except Exception as e:
-        print(f"Telegram API error: {e}")
+        logger.error(f"Telegram API error: {e}")
         return {"ok": False, "error": str(e)}
 
 
@@ -177,11 +190,11 @@ def download_file(file_id: str) -> tuple:
         response.raise_for_status()
         
         filename = file_path.split('/')[-1] if '/' in file_path else f"photo_{file_id}.jpg"
-        print(f"Photo downloaded: {filename}, {len(response.content)} bytes")
+        logger.info(f"Photo downloaded: {filename}, {len(response.content)} bytes")
         
         return response.content, filename
     except Exception as e:
-        print(f"Error downloading file: {e}")
+        logger.error(f"Error downloading file: {e}")
         return None, None
 
 
@@ -197,7 +210,7 @@ def encode_image_to_base64(image_bytes: bytes) -> str:
 def analyze_image_with_vision(image_base64: str, user_text: str) -> str:
     """使用 OpenAI Vision API 分析图片"""
     try:
-        print("Calling Vision API to analyze image...")
+        logger.info("Calling Vision API to analyze image...")
         
         response = client.chat.completions.create(
             model="gpt-5.2",
@@ -234,12 +247,12 @@ def analyze_image_with_vision(image_base64: str, user_text: str) -> str:
         )
         
         analysis = response.choices[0].message.content
-        print(f"Vision analysis completed: {analysis[:100]}...")
+        logger.info(f"Vision analysis completed: {analysis[:100]}...")
         return analysis
         
     except Exception as e:
         error_msg = f"图片分析失败：{str(e)}"
-        print(error_msg)
+        logger.error(error_msg)
         return error_msg
 
 
@@ -308,11 +321,11 @@ def create_jira_issue(title: str, description: str, bug_type: str) -> dict:
             }
         }
 
-        print(f"Creating Jira issue with title: {title}")
+        logger.info(f"Creating Jira issue with title: {title}")
         response = requests.post(url, headers=headers, auth=auth, data=json.dumps(payload), timeout=30)
         
         if response.status_code >= 400:
-            print(f"Jira API error: {response.status_code} - {response.text}")
+            logger.error(f"Jira API error: {response.status_code} - {response.text}")
         
         response.raise_for_status()
         result = response.json()
@@ -571,7 +584,7 @@ def run_agent(user_id: int, user_message: str, image_analysis: str = None) -> di
                 function_name = tool_call.function.name
                 function_args = json.loads(tool_call.function.arguments)
                 
-                print(f"Tool call: {function_name} with args: {function_args}")
+                logger.info(f"Tool call: {function_name} with args: {function_args}")
                 
                 if function_name == "create_jira_issue":
                     result = create_jira_issue(
@@ -636,7 +649,7 @@ def run_agent(user_id: int, user_message: str, image_analysis: str = None) -> di
         
     except Exception as e:
         error_msg = f"Agent 处理失败：{str(e)}"
-        print(error_msg)
+        logger.error(error_msg)
         import traceback
         traceback.print_exc()
         return {"reply": error_msg, "jira_result": None}
@@ -729,41 +742,26 @@ def format_jira_success_message(jira_result: dict) -> str:
     return "\n".join(lines)
 
 
-def process_message_async(chat_id: int, message_id: int, user_id: int, text: str, photo_file_id: str = None):
-    """异步处理用户消息"""
-    status_msg_id = None
-    
+def process_message_async(chat_id: int, message_id: int, user_id: int, text: str, photo_file_id: str = None, status_msg_id: int = None):
+    """异步处理用户消息（即时反馈已在主线程发送）"""
     try:
-        print(f"[Async] Starting to process message: text='{text[:50]}...', photo={photo_file_id is not None}")
+        logger.info(f"[Async] Starting to process message: text='{text[:50] if text else ''}...', photo={photo_file_id is not None}, status_msg_id={status_msg_id}")
         
         bot_username = get_bot_username()
-        print(f"[Async] Bot username: {bot_username}")
-        
-        # 只在被 @ 时触发
-        if not bot_username or f"@{bot_username}" not in text:
-            print(f"[Async] Message does not mention bot, skipping. Looking for '@{bot_username}' in '{text}'")
-            return
-        
         user_message = text.replace(f"@{bot_username}", "").strip()
         
         if not user_message and not photo_file_id:
-            send_message(chat_id, "请告诉我你遇到了什么问题？可以附上截图。", message_id, parse_mode=None)
+            if status_msg_id:
+                edit_message(chat_id, status_msg_id, "请告诉我你遇到了什么问题？可以附上截图。", parse_mode=None)
+            else:
+                send_message(chat_id, "请告诉我你遇到了什么问题？可以附上截图。", message_id, parse_mode=None)
             return
-        
-        # 第一步：立即发送确认消息
-        if photo_file_id:
-            status_text = "📸 收到截图，正在分析图片和问题..."
-        else:
-            status_text = "📝 收到问题，正在分析..."
-        
-        status_result = send_message(chat_id, status_text, message_id, parse_mode=None)
-        status_msg_id = status_result.get("result", {}).get("message_id") if status_result.get("ok") else None
         
         image_analysis = None
         
         # 如果有图片，下载并分析
         if photo_file_id:
-            print(f"Processing photo: {photo_file_id}")
+            logger.info(f"Processing photo: {photo_file_id}")
             
             # 更新状态：正在下载图片
             if status_msg_id:
@@ -827,11 +825,28 @@ def process_message_async(chat_id: int, message_id: int, user_id: int, text: str
 
 
 def handle_user_message(chat_id: int, message_id: int, user_id: int, text: str, photo_file_id: str = None):
-    """处理用户消息 - 启动异步处理线程"""
+    """处理用户消息 - 先发送即时反馈，然后启动异步处理线程"""
+    # 检查是否 @ 了机器人
+    bot_username = get_bot_username()
+    if not bot_username or f"@{bot_username}" not in text:
+        # 没有 @ 机器人，不处理
+        return
+    
+    # 立即发送确认消息（在主线程中）
+    if photo_file_id:
+        status_text = "📸 收到截图，正在分析图片和问题..."
+    else:
+        status_text = "📝 收到问题，正在分析..."
+    
+    status_result = send_message(chat_id, status_text, message_id, parse_mode=None)
+    status_msg_id = status_result.get("result", {}).get("message_id") if status_result.get("ok") else None
+    
+    logger.info(f"Sent immediate feedback, status_msg_id: {status_msg_id}")
+    
     # 在后台线程中处理消息
     thread = threading.Thread(
         target=process_message_async,
-        args=(chat_id, message_id, user_id, text, photo_file_id)
+        args=(chat_id, message_id, user_id, text, photo_file_id, status_msg_id)
     )
     thread.daemon = True
     thread.start()
@@ -854,18 +869,19 @@ def webhook():
         update = request.get_json(force=True)
         update_id = update.get("update_id")
         
-        print(f"Received webhook update: {str(update)[:200]}...")
+        logger.info(f"Received webhook update: {str(update)[:200]}...")
+        sys.stdout.flush()
         
         # 消息去重检查
         if update_id and message_cache.is_duplicate(update_id):
-            print(f"Duplicate update_id: {update_id}, skipping...")
+            logger.info(f"Duplicate update_id: {update_id}, skipping...")
             return Response('OK', status=200)
         
-        print(f"Processing update_id: {update_id}")
+        logger.info(f"Processing update_id: {update_id}")
         
         message = update.get("message")
         if not message:
-            print("No message in update, skipping...")
+            logger.info("No message in update, skipping...")
             return Response('OK', status=200)
         
         chat_id = message.get("chat", {}).get("id")
@@ -874,7 +890,7 @@ def webhook():
         text = message.get("text") or message.get("caption") or ""
         has_photo = bool(message.get("photo"))
         
-        print(f"Message from chat {chat_id}, user {user_id}: text='{text[:50]}...', has_photo={has_photo}")
+        logger.info(f"Message from chat {chat_id}, user {user_id}: text='{text[:50] if text else ''}...', has_photo={has_photo}")
         
         # 处理命令
         if text.startswith("/start"):
@@ -896,7 +912,7 @@ def webhook():
         return Response('OK', status=200)
         
     except Exception as e:
-        print(f"Webhook error: {e}")
+        logger.error(f"Webhook error: {e}")
         import traceback
         traceback.print_exc()
         # 即使出错也返回 200，避免 Telegram 重试
@@ -906,14 +922,14 @@ def webhook():
 def setup_webhook():
     """设置 Telegram Webhook"""
     if not WEBHOOK_URL:
-        print("Warning: WEBHOOK_URL not set, webhook will not be configured")
+        logger.warning("WEBHOOK_URL not set, webhook will not be configured")
         return False
     
     webhook_url = f"{WEBHOOK_URL}/webhook"
     
     # 先删除旧的 webhook
     delete_result = telegram_api("deleteWebhook", {"drop_pending_updates": True})
-    print(f"Delete webhook response: {delete_result}")
+    logger.info(f"Delete webhook response: {delete_result}")
     
     # 设置新的 webhook
     set_result = telegram_api("setWebhook", {
@@ -921,7 +937,7 @@ def setup_webhook():
         "drop_pending_updates": True,
         "allowed_updates": ["message", "edited_message"]
     })
-    print(f"Set webhook response: {set_result}")
+    logger.info(f"Set webhook response: {set_result}")
     
     return set_result.get("ok", False)
 
@@ -931,20 +947,22 @@ def setup_webhook():
 # ============================================================
 
 if __name__ == "__main__":
-    print("Starting Jira Agent Bot in Pure Webhook Mode v3...")
-    print(f"WEBHOOK_URL: {WEBHOOK_URL}")
-    print(f"PORT: {PORT}")
+    logger.info("Starting Jira Agent Bot in Pure Webhook Mode v4...")
+    logger.info(f"WEBHOOK_URL: {WEBHOOK_URL}")
+    logger.info(f"PORT: {PORT}")
+    sys.stdout.flush()
     
     # 预热机器人用户名缓存
     bot_username = get_bot_username()
-    print(f"Bot username: {bot_username}")
+    logger.info(f"Bot username: {bot_username}")
     
     # 设置 Webhook
     if setup_webhook():
-        print("Webhook configured successfully")
+        logger.info("Webhook configured successfully")
     else:
-        print("Warning: Webhook configuration failed or WEBHOOK_URL not set")
+        logger.warning("Webhook configuration failed or WEBHOOK_URL not set")
     
     # 启动 Flask 服务器
-    print(f"Starting Flask server on port {PORT}...")
+    logger.info(f"Starting Flask server on port {PORT}...")
+    sys.stdout.flush()
     app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
