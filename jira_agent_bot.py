@@ -99,6 +99,7 @@ def analyze_image_with_vision(image_base64: str, user_text: str) -> str:
         
         response = client.chat.completions.create(
             model="gpt-5.2",
+            max_completion_tokens=1500,
             messages=[
                 {
                     "role": "system",
