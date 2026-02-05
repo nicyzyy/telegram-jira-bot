@@ -1,0 +1,30 @@
+# 日志分析 - Jira 创建失败问题
+
+## 时间线
+- 03:15:12 PM - 收到 webhook 更新，消息包含 @jira9527bot 和截图
+- 03:15:13 PM - 即时反馈发送成功，status_msg_id: 222
+- 03:15:13 PM - 开始异步处理消息
+- 03:15:16 PM - 截图下载成功: file_21.jpg, 109096 bytes
+- 03:15:17 PM - 调用 Vision API 分析图片
+- 03:15:46 PM - Vision 分析完成
+- 03:15:47 PM - 调用 OpenAI API 进行 agent 决策
+- 03:16:22 PM - OpenAI API 响应收到
+- 03:16:22 PM - **问题**: Assistant message: tool_calls=False, content=None
+
+## 问题根源
+OpenAI API 返回的响应中：
+- tool_calls=False（没有工具调用）
+- content=None（没有内容）
+
+这意味着 Agent 没有决定调用 create_jira_issue 工具，导致 Jira 没有被创建。
+
+## 可能原因
+1. Agent 的 system prompt 不够明确，导致 AI 没有理解需要调用工具
+2. OpenAI API 返回了空响应
+3. 工具定义可能有问题
+
+## 解决方案
+需要检查和优化 run_agent 函数中的：
+1. system prompt
+2. tools 定义
+3. 错误处理逻辑（当没有 tool_calls 时应该有回退机制）

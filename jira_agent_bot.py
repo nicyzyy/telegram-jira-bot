@@ -919,14 +919,14 @@ def run_agent(user_id: int, user_message: str, image_analysis: str = None) -> di
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(get_user_session(user_id))
         
-        # 调用 OpenAI
+        # 调用 OpenAI - 强制调用 create_jira_issue 工具
         logger.info(f"Calling OpenAI API for agent decision...")
         try:
             response = client.chat.completions.create(
                 model="gpt-5",
                 messages=messages,
                 tools=tools,
-                tool_choice="auto",
+                tool_choice={"type": "function", "function": {"name": "create_jira_issue"}},  # 强制调用 create_jira_issue
                 max_completion_tokens=2000,
                 timeout=120  # 增加超时时间
             )
@@ -1006,9 +1006,53 @@ def run_agent(user_id: int, user_message: str, image_analysis: str = None) -> di
             
             reply = final_response.choices[0].message.content
         else:
-            reply = assistant_message.content
+            # 如果没有工具调用，使用回退机制直接创建 Jira Issue
+            logger.warning("No tool calls from OpenAI, using fallback mechanism")
+            
+            # 从用户消息中提取标题和描述
+            user_text = user_message.replace("@jira9527bot", "").strip()
+            
+            # 生成简单的标题（取前50个字符）
+            title = user_text[:50] if len(user_text) > 50 else user_text
+            if not title:
+                title = "用户报告的问题"
+            
+            # 生成描述
+            description = f"""问题现象：
+{user_text}
+
+"""
+            if image_analysis:
+                description += f"""截图分析：
+{image_analysis}
+"""
+            
+            # 判断 BUG 类型（默认为 UI/UX 问题）
+            bug_type = "UI/UX问题"
+            if any(kw in user_text.lower() for kw in ["功能", "报错", "崩溃", "异常", "数据", "接口", "api", "后台"]):
+                bug_type = "开发BUG"
+            
+            logger.info(f"Fallback: Creating Jira issue with title: {title}, bug_type: {bug_type}")
+            jira_result = create_jira_issue(title, description, bug_type)
+            
+            # 如果有待上传的图片，上传到 Issue
+            if jira_result.get("success") and user_id in pending_images:
+                image_data = pending_images[user_id]
+                upload_result = upload_attachment_to_jira(
+                    jira_result["issue_key"],
+                    image_data["bytes"],
+                    image_data["filename"]
+                )
+                if upload_result.get("success"):
+                    jira_result["attachment_uploaded"] = True
+                del pending_images[user_id]
+            
+            if jira_result.get("success"):
+                reply = f"✅ 已创建 Jira Issue: {jira_result['issue_key']}\n📝 {jira_result['title'][:50]}...\n📎 截图已附加\n🔗 {jira_result['url']}"
+            else:
+                reply = f"❌ 创建 Jira Issue 失败：{jira_result.get('error', '未知错误')}"
         
-        add_to_session(user_id, "assistant", reply)
+        add_to_session(user_id, "assistant", reply if reply else "处理完成")
         return {"reply": reply, "jira_result": jira_result}
         
     except Exception as e:
