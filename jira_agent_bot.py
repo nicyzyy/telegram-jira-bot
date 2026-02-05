@@ -1048,7 +1048,7 @@ def run_agent(user_id: int, user_message: str, image_analysis: str = None) -> di
                 del pending_images[user_id]
             
             if jira_result.get("success"):
-                reply = f"✅ 已创建 Jira Issue: {jira_result['issue_key']}\n📝 {jira_result['title'][:50]}...\n📎 截图已附加\n🔗 {jira_result['url']}"
+                reply = f"✅ 已创建 Jira Issue: {jira_result['issue_key']}\n📝 {jira_result['title'][:50]}...\n📎 截图已附加\n🔗 {jira_result['issue_url']}"
             else:
                 reply = f"❌ 创建 Jira Issue 失败：{jira_result.get('error', '未知错误')}"
         
