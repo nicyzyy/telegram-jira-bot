@@ -40,7 +40,49 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 
 # --- Notification Bot (for Jira webhook notifications) ---
 NOTIFY_BOT_TOKEN = os.getenv("NOTIFY_BOT_TOKEN", "")
-NOTIFY_CHAT_ID = os.getenv("NOTIFY_CHAT_ID", "")  # 群组 ID，用于发送通知
+
+# 通知机器人所在的群组 ID 列表（使用文件存储以持久化）
+NOTIFY_GROUPS_FILE = "/tmp/notify_groups.json"
+
+def load_notify_groups() -> set:
+    """加载通知群组列表"""
+    try:
+        if os.path.exists(NOTIFY_GROUPS_FILE):
+            with open(NOTIFY_GROUPS_FILE, 'r') as f:
+                data = json.load(f)
+                return set(data.get("groups", []))
+    except Exception as e:
+        logger.error(f"Error loading notify groups: {e}")
+    return set()
+
+def save_notify_groups(groups: set):
+    """保存通知群组列表"""
+    try:
+        with open(NOTIFY_GROUPS_FILE, 'w') as f:
+            json.dump({"groups": list(groups)}, f)
+        logger.info(f"Saved {len(groups)} notify groups")
+    except Exception as e:
+        logger.error(f"Error saving notify groups: {e}")
+
+def add_notify_group(chat_id: int):
+    """添加通知群组"""
+    groups = load_notify_groups()
+    if chat_id not in groups:
+        groups.add(chat_id)
+        save_notify_groups(groups)
+        logger.info(f"Added notify group: {chat_id}")
+        return True
+    return False
+
+def remove_notify_group(chat_id: int):
+    """移除通知群组"""
+    groups = load_notify_groups()
+    if chat_id in groups:
+        groups.remove(chat_id)
+        save_notify_groups(groups)
+        logger.info(f"Removed notify group: {chat_id}")
+        return True
+    return False
 
 # --- Assignee IDs ---
 ASSIGNEE_DEV = "712020:29364cb3-1ba1-453c-8e28-4e0306787939"
@@ -275,7 +317,7 @@ def analyze_image_with_vision(image_base64: str, user_text: str) -> str:
 # Jira API Functions
 # ============================================================
 
-def create_jira_issue(title: str, description: str, bug_type: str, chat_id: int = None) -> dict:
+def create_jira_issue(title: str, description: str, bug_type: str) -> dict:
     """创建 Jira Issue"""
     try:
         url = f"https://{JIRA_DOMAIN}/rest/api/3/issue"
@@ -330,11 +372,6 @@ def create_jira_issue(title: str, description: str, bug_type: str, chat_id: int 
                     })
                     break
 
-        # 准备 Labels，包含群组 ID 用于后续通知
-        labels = []
-        if chat_id:
-            labels.append(f"tg_chat_{chat_id}")
-        
         payload = {
             "fields": {
                 "project": {"key": JIRA_PROJECT_KEY},
@@ -347,8 +384,7 @@ def create_jira_issue(title: str, description: str, bug_type: str, chat_id: int 
                     ]
                 },
                 "issuetype": {"name": "缺陷"},
-                "assignee": {"accountId": assignee_id},
-                "labels": labels
+                "assignee": {"accountId": assignee_id}
             }
         }
 
@@ -482,47 +518,30 @@ def notify_bot_api(method: str, data: dict = None, files: dict = None) -> dict:
         return {"ok": False, "error": str(e)}
 
 
-def send_notification(text: str, image_url: str = None, chat_id: int = None) -> dict:
-    """通过通知机器人发送消息到群组
+def send_notification_to_chat(chat_id: int, text: str, image_bytes: bytes = None) -> dict:
+    """向单个群组发送通知
     
     Args:
+        chat_id: 目标群组 ID
         text: 通知文本
-        image_url: 图片 URL（可选）
-        chat_id: 目标群组 ID（可选，如果不提供则使用环境变量 NOTIFY_CHAT_ID）
+        image_bytes: 图片字节数据（可选）
     """
-    # 优先使用传入的 chat_id，否则使用环境变量
-    target_chat_id = chat_id
-    if not target_chat_id and NOTIFY_CHAT_ID:
-        target_chat_id = int(NOTIFY_CHAT_ID)
-    
-    if not target_chat_id:
-        logger.warning("No chat_id provided and NOTIFY_CHAT_ID not set, notification skipped")
-        return {"ok": False, "error": "No chat_id available"}
-    
-    chat_id = target_chat_id
-    
-    # 如果有图片，先发送图片再发送文字
-    if image_url:
+    # 如果有图片，发送图片并附带文字
+    if image_bytes:
         try:
-            # 尝试下载图片并发送
-            logger.info(f"Downloading image from Jira: {image_url}")
-            auth = (JIRA_EMAIL, JIRA_API_TOKEN)
-            img_response = requests.get(image_url, auth=auth, timeout=30)
-            if img_response.status_code == 200:
-                # 发送图片并附带文字
-                files = {"photo": ("attachment.jpg", img_response.content, "image/jpeg")}
-                data = {
-                    "chat_id": chat_id,
-                    "caption": text,
-                    "parse_mode": "Markdown"
-                }
-                result = notify_bot_api("sendPhoto", data=data, files=files)
-                if result.get("ok"):
-                    return result
-                else:
-                    logger.warning(f"Failed to send photo: {result}, falling back to text only")
+            files = {"photo": ("attachment.jpg", image_bytes, "image/jpeg")}
+            data = {
+                "chat_id": chat_id,
+                "caption": text,
+                "parse_mode": "Markdown"
+            }
+            result = notify_bot_api("sendPhoto", data=data, files=files)
+            if result.get("ok"):
+                return result
+            else:
+                logger.warning(f"Failed to send photo to {chat_id}: {result}, falling back to text only")
         except Exception as e:
-            logger.error(f"Error sending photo notification: {e}")
+            logger.error(f"Error sending photo notification to {chat_id}: {e}")
     
     # 发送纯文字消息
     data = {
@@ -538,6 +557,54 @@ def send_notification(text: str, image_url: str = None, chat_id: int = None) -> 
         result = notify_bot_api("sendMessage", data)
     
     return result
+
+
+def broadcast_notification(text: str, image_url: str = None) -> dict:
+    """向所有通知群组广播消息
+    
+    Args:
+        text: 通知文本
+        image_url: Jira 图片 URL（可选）
+    """
+    groups = load_notify_groups()
+    
+    if not groups:
+        logger.warning("No notify groups registered, notification skipped")
+        return {"ok": False, "error": "No notify groups"}
+    
+    # 如果有图片 URL，先下载图片
+    image_bytes = None
+    if image_url:
+        try:
+            logger.info(f"Downloading image from Jira: {image_url}")
+            auth = (JIRA_EMAIL, JIRA_API_TOKEN)
+            img_response = requests.get(image_url, auth=auth, timeout=30)
+            if img_response.status_code == 200:
+                image_bytes = img_response.content
+        except Exception as e:
+            logger.error(f"Error downloading image: {e}")
+    
+    # 向所有群组发送通知
+    results = []
+    for chat_id in groups:
+        try:
+            result = send_notification_to_chat(chat_id, text, image_bytes)
+            results.append({"chat_id": chat_id, "result": result})
+            
+            # 如果发送失败且是因为机器人被移除，则从列表中删除
+            if not result.get("ok"):
+                error_desc = str(result.get("description", "")).lower()
+                if "chat not found" in error_desc or "bot was kicked" in error_desc or "forbidden" in error_desc:
+                    logger.warning(f"Removing invalid group {chat_id}: {error_desc}")
+                    remove_notify_group(chat_id)
+        except Exception as e:
+            logger.error(f"Error sending notification to {chat_id}: {e}")
+            results.append({"chat_id": chat_id, "error": str(e)})
+    
+    success_count = sum(1 for r in results if r.get("result", {}).get("ok"))
+    logger.info(f"Broadcast completed: {success_count}/{len(results)} successful")
+    
+    return {"ok": True, "results": results, "success_count": success_count}
 
 
 def get_jira_issue_attachments(issue_key: str) -> list:
@@ -626,22 +693,6 @@ def handle_jira_webhook(payload: dict) -> dict:
         # 获取基本信息
         summary = fields.get("summary", "无标题")
         
-        # 从 Labels 中提取群组 ID
-        labels = fields.get("labels", [])
-        chat_id = None
-        for label in labels:
-            if label.startswith("tg_chat_"):
-                try:
-                    chat_id = int(label.replace("tg_chat_", ""))
-                    logger.info(f"Found chat_id from label: {chat_id}")
-                    break
-                except ValueError:
-                    pass
-        
-        if not chat_id:
-            logger.warning(f"No chat_id found in labels for {issue_key}, skipping notification")
-            return {"ok": False, "error": "No chat_id in labels"}
-        
         # 获取描述（Jira 描述是 ADF 格式，需要提取文本）
         description_adf = fields.get("description", {})
         description = extract_text_from_adf(description_adf) if description_adf else "无描述"
@@ -687,14 +738,14 @@ def handle_jira_webhook(payload: dict) -> dict:
         attachments = get_jira_issue_attachments(issue_key)
         image_url = attachments[0]["url"] if attachments else None
         
-        # 发送通知
-        logger.info(f"Sending Jira notification for {issue_key}, event_type={event_type}, chat_id={chat_id}")
-        result = send_notification(notification_text, image_url, chat_id)
+        # 广播通知到所有群组
+        logger.info(f"Broadcasting Jira notification for {issue_key}, event_type={event_type}")
+        result = broadcast_notification(notification_text, image_url)
         
         if result.get("ok"):
-            logger.info(f"Jira notification sent successfully for {issue_key}")
+            logger.info(f"Jira notification broadcast completed for {issue_key}: {result.get('success_count')} groups")
         else:
-            logger.error(f"Failed to send Jira notification: {result}")
+            logger.error(f"Failed to broadcast Jira notification: {result}")
         
         return result
         
@@ -826,7 +877,7 @@ def clear_user_session(user_id: int):
 # Agent Logic
 # ============================================================
 
-def run_agent(user_id: int, user_message: str, image_analysis: str = None, chat_id: int = None) -> dict:
+def run_agent(user_id: int, user_message: str, image_analysis: str = None) -> dict:
     """
     运行 Agent 处理用户消息
     
@@ -834,7 +885,6 @@ def run_agent(user_id: int, user_message: str, image_analysis: str = None, chat_
         user_id: 用户 ID
         user_message: 用户消息
         image_analysis: 图片分析结果（可选）
-        chat_id: Telegram 群组 ID，用于保存到 Jira Issue
     
     返回: {"reply": str, "jira_result": dict or None}
     """
@@ -904,8 +954,7 @@ def run_agent(user_id: int, user_message: str, image_analysis: str = None, chat_
                     result = create_jira_issue(
                         function_args["title"],
                         function_args["description"],
-                        function_args["bug_type"],
-                        chat_id=chat_id
+                        function_args["bug_type"]
                     )
                     
                     # 如果有待上传的图片，上传到 Issue
@@ -1106,7 +1155,7 @@ def process_message_async(chat_id: int, message_id: int, user_id: int, text: str
             edit_message(chat_id, status_msg_id, "⏳ 正在创建 Jira Issue...", parse_mode=None)
         
         # 运行 Agent
-        result = run_agent(user_id, user_message or "请根据截图分析问题", image_analysis, chat_id=chat_id)
+        result = run_agent(user_id, user_message or "请根据截图分析问题", image_analysis)
         
         # 删除状态消息
         if status_msg_id:
@@ -1244,6 +1293,68 @@ def webhook():
         return Response('OK', status=200)
 
 
+@app.route('/notify-webhook', methods=['POST'])
+def notify_webhook():
+    """通知机器人 @jira9528reportbot 的 Webhook 端点
+    用于自动记录机器人所在的群组
+    """
+    try:
+        update = request.get_json(force=True)
+        logger.info(f"Received notify bot update: {str(update)[:200]}...")
+        
+        # 处理机器人被添加到群组的事件
+        my_chat_member = update.get("my_chat_member")
+        if my_chat_member:
+            chat = my_chat_member.get("chat", {})
+            chat_id = chat.get("id")
+            chat_type = chat.get("type", "")
+            new_status = my_chat_member.get("new_chat_member", {}).get("status", "")
+            
+            # 只处理群组（不处理私聊）
+            if chat_type in ["group", "supergroup"]:
+                if new_status in ["member", "administrator"]:
+                    # 机器人被添加到群组
+                    add_notify_group(chat_id)
+                    logger.info(f"Notify bot added to group: {chat_id}")
+                    
+                    # 发送欢迎消息
+                    welcome_text = "👋 大家好！我是 Jira 通知机器人。\n\n当 Jira 项目中有新 BUG 创建或指派时，我会在这里发送通知。"
+                    send_notification_to_chat(chat_id, welcome_text)
+                    
+                elif new_status in ["left", "kicked"]:
+                    # 机器人被移除出群组
+                    remove_notify_group(chat_id)
+                    logger.info(f"Notify bot removed from group: {chat_id}")
+        
+        # 处理普通消息（可以用于手动注册群组）
+        message = update.get("message")
+        if message:
+            chat = message.get("chat", {})
+            chat_id = chat.get("id")
+            chat_type = chat.get("type", "")
+            text = message.get("text", "")
+            
+            # 只处理群组消息
+            if chat_type in ["group", "supergroup"]:
+                # 确保群组已注册
+                if add_notify_group(chat_id):
+                    logger.info(f"Notify group registered via message: {chat_id}")
+                
+                # 如果是 /status 命令，回复状态
+                if text.strip() == "/status":
+                    groups = load_notify_groups()
+                    status_text = f"✅ 通知机器人已激活\n📊 当前监控 {len(groups)} 个群组"
+                    send_notification_to_chat(chat_id, status_text)
+        
+        return Response('OK', status=200)
+        
+    except Exception as e:
+        logger.error(f"Notify webhook error: {e}")
+        import traceback
+        traceback.print_exc()
+        return Response('OK', status=200)
+
+
 @app.route('/jira-webhook', methods=['POST'])
 def jira_webhook():
     """Jira Webhook 端点，接收 Jira 事件通知"""
@@ -1294,25 +1405,69 @@ def setup_webhook():
     return set_result.get("ok", False)
 
 
+def setup_notify_webhook():
+    """设置通知机器人的 Webhook"""
+    if not WEBHOOK_URL or not NOTIFY_BOT_TOKEN:
+        logger.warning("WEBHOOK_URL or NOTIFY_BOT_TOKEN not set, notify webhook will not be configured")
+        return False
+    
+    notify_webhook_url = f"{WEBHOOK_URL}/notify-webhook"
+    
+    # 使用通知机器人的 Token
+    url = f"https://api.telegram.org/bot{NOTIFY_BOT_TOKEN}/setWebhook"
+    
+    # 先删除旧的 webhook
+    delete_url = f"https://api.telegram.org/bot{NOTIFY_BOT_TOKEN}/deleteWebhook"
+    try:
+        delete_result = requests.post(delete_url, json={"drop_pending_updates": True}, timeout=30).json()
+        logger.info(f"Delete notify webhook response: {delete_result}")
+    except Exception as e:
+        logger.error(f"Error deleting notify webhook: {e}")
+    
+    # 设置新的 webhook
+    try:
+        set_result = requests.post(url, json={
+            "url": notify_webhook_url,
+            "drop_pending_updates": True,
+            "allowed_updates": ["message", "my_chat_member"]
+        }, timeout=30).json()
+        logger.info(f"Set notify webhook response: {set_result}")
+        return set_result.get("ok", False)
+    except Exception as e:
+        logger.error(f"Error setting notify webhook: {e}")
+        return False
+
+
 # ============================================================
 # Main
 # ============================================================
 
 if __name__ == "__main__":
-    logger.info("Starting Jira Agent Bot in Pure Webhook Mode v4...")
+    logger.info("Starting Jira Agent Bot in Pure Webhook Mode v8...")
     logger.info(f"WEBHOOK_URL: {WEBHOOK_URL}")
     logger.info(f"PORT: {PORT}")
+    logger.info(f"NOTIFY_BOT_TOKEN: {'set' if NOTIFY_BOT_TOKEN else 'not set'}")
     sys.stdout.flush()
     
     # 预热机器人用户名缓存
     bot_username = get_bot_username()
     logger.info(f"Bot username: {bot_username}")
     
-    # 设置 Webhook
+    # 设置主机器人 Webhook
     if setup_webhook():
-        logger.info("Webhook configured successfully")
+        logger.info("Main bot webhook configured successfully")
     else:
-        logger.warning("Webhook configuration failed or WEBHOOK_URL not set")
+        logger.warning("Main bot webhook configuration failed or WEBHOOK_URL not set")
+    
+    # 设置通知机器人 Webhook
+    if setup_notify_webhook():
+        logger.info("Notify bot webhook configured successfully")
+    else:
+        logger.warning("Notify bot webhook configuration failed")
+    
+    # 加载已注册的通知群组
+    notify_groups = load_notify_groups()
+    logger.info(f"Loaded {len(notify_groups)} notify groups")
     
     # 启动 Flask 服务器
     logger.info(f"Starting Flask server on port {PORT}...")
