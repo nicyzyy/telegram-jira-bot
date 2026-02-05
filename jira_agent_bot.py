@@ -41,31 +41,69 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 # --- Notification Bot (for Jira webhook notifications) ---
 NOTIFY_BOT_TOKEN = os.getenv("NOTIFY_BOT_TOKEN", "")
 
-# 通知机器人所在的群组 ID 列表（使用文件存储以持久化）
+# 通知群组 ID 列表
+# 优先从环境变量读取（持久化），同时支持运行时动态添加
+NOTIFY_GROUP_IDS_ENV = os.getenv("NOTIFY_GROUP_IDS", "")  # 逗号分隔的群组 ID
 NOTIFY_GROUPS_FILE = "/tmp/notify_groups.json"
 
+# 运行时群组缓存（内存中）
+_runtime_notify_groups = set()
+
+def get_env_notify_groups() -> set:
+    """从环境变量获取预设的群组 ID"""
+    groups = set()
+    if NOTIFY_GROUP_IDS_ENV:
+        for gid in NOTIFY_GROUP_IDS_ENV.split(","):
+            gid = gid.strip()
+            if gid:
+                try:
+                    groups.add(int(gid))
+                except ValueError:
+                    logger.warning(f"Invalid group ID in NOTIFY_GROUP_IDS: {gid}")
+    return groups
+
 def load_notify_groups() -> set:
-    """加载通知群组列表"""
+    """加载通知群组列表（环境变量 + 文件 + 运行时缓存）"""
+    global _runtime_notify_groups
+    
+    # 1. 从环境变量获取（最高优先级，持久化）
+    groups = get_env_notify_groups()
+    
+    # 2. 从文件加载（如果存在）
     try:
         if os.path.exists(NOTIFY_GROUPS_FILE):
             with open(NOTIFY_GROUPS_FILE, 'r') as f:
                 data = json.load(f)
-                return set(data.get("groups", []))
+                file_groups = set(data.get("groups", []))
+                groups.update(file_groups)
     except Exception as e:
-        logger.error(f"Error loading notify groups: {e}")
-    return set()
+        logger.error(f"Error loading notify groups from file: {e}")
+    
+    # 3. 合并运行时缓存
+    groups.update(_runtime_notify_groups)
+    
+    logger.info(f"Loaded {len(groups)} notify groups: {groups}")
+    return groups
 
 def save_notify_groups(groups: set):
-    """保存通知群组列表"""
+    """保存通知群组列表到文件"""
     try:
         with open(NOTIFY_GROUPS_FILE, 'w') as f:
             json.dump({"groups": list(groups)}, f)
-        logger.info(f"Saved {len(groups)} notify groups")
+        logger.info(f"Saved {len(groups)} notify groups to file")
     except Exception as e:
         logger.error(f"Error saving notify groups: {e}")
 
 def add_notify_group(chat_id: int):
     """添加通知群组"""
+    global _runtime_notify_groups
+    
+    # 添加到运行时缓存
+    if chat_id not in _runtime_notify_groups:
+        _runtime_notify_groups.add(chat_id)
+        logger.info(f"Added notify group to runtime cache: {chat_id}")
+    
+    # 同时保存到文件
     groups = load_notify_groups()
     if chat_id not in groups:
         groups.add(chat_id)
@@ -76,6 +114,12 @@ def add_notify_group(chat_id: int):
 
 def remove_notify_group(chat_id: int):
     """移除通知群组"""
+    global _runtime_notify_groups
+    
+    # 从运行时缓存移除
+    _runtime_notify_groups.discard(chat_id)
+    
+    # 从文件移除
     groups = load_notify_groups()
     if chat_id in groups:
         groups.remove(chat_id)
