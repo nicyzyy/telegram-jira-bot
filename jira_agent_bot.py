@@ -275,7 +275,7 @@ def analyze_image_with_vision(image_base64: str, user_text: str) -> str:
 # Jira API Functions
 # ============================================================
 
-def create_jira_issue(title: str, description: str, bug_type: str) -> dict:
+def create_jira_issue(title: str, description: str, bug_type: str, chat_id: int = None) -> dict:
     """创建 Jira Issue"""
     try:
         url = f"https://{JIRA_DOMAIN}/rest/api/3/issue"
@@ -330,6 +330,11 @@ def create_jira_issue(title: str, description: str, bug_type: str) -> dict:
                     })
                     break
 
+        # 准备 Labels，包含群组 ID 用于后续通知
+        labels = []
+        if chat_id:
+            labels.append(f"tg_chat_{chat_id}")
+        
         payload = {
             "fields": {
                 "project": {"key": JIRA_PROJECT_KEY},
@@ -342,7 +347,8 @@ def create_jira_issue(title: str, description: str, bug_type: str) -> dict:
                     ]
                 },
                 "issuetype": {"name": "缺陷"},
-                "assignee": {"accountId": assignee_id}
+                "assignee": {"accountId": assignee_id},
+                "labels": labels
             }
         }
 
@@ -476,13 +482,24 @@ def notify_bot_api(method: str, data: dict = None, files: dict = None) -> dict:
         return {"ok": False, "error": str(e)}
 
 
-def send_notification(text: str, image_url: str = None) -> dict:
-    """通过通知机器人发送消息到群组"""
-    if not NOTIFY_CHAT_ID:
-        logger.warning("NOTIFY_CHAT_ID not set, notification skipped")
-        return {"ok": False, "error": "NOTIFY_CHAT_ID not set"}
+def send_notification(text: str, image_url: str = None, chat_id: int = None) -> dict:
+    """通过通知机器人发送消息到群组
     
-    chat_id = int(NOTIFY_CHAT_ID)
+    Args:
+        text: 通知文本
+        image_url: 图片 URL（可选）
+        chat_id: 目标群组 ID（可选，如果不提供则使用环境变量 NOTIFY_CHAT_ID）
+    """
+    # 优先使用传入的 chat_id，否则使用环境变量
+    target_chat_id = chat_id
+    if not target_chat_id and NOTIFY_CHAT_ID:
+        target_chat_id = int(NOTIFY_CHAT_ID)
+    
+    if not target_chat_id:
+        logger.warning("No chat_id provided and NOTIFY_CHAT_ID not set, notification skipped")
+        return {"ok": False, "error": "No chat_id available"}
+    
+    chat_id = target_chat_id
     
     # 如果有图片，先发送图片再发送文字
     if image_url:
@@ -609,6 +626,22 @@ def handle_jira_webhook(payload: dict) -> dict:
         # 获取基本信息
         summary = fields.get("summary", "无标题")
         
+        # 从 Labels 中提取群组 ID
+        labels = fields.get("labels", [])
+        chat_id = None
+        for label in labels:
+            if label.startswith("tg_chat_"):
+                try:
+                    chat_id = int(label.replace("tg_chat_", ""))
+                    logger.info(f"Found chat_id from label: {chat_id}")
+                    break
+                except ValueError:
+                    pass
+        
+        if not chat_id:
+            logger.warning(f"No chat_id found in labels for {issue_key}, skipping notification")
+            return {"ok": False, "error": "No chat_id in labels"}
+        
         # 获取描述（Jira 描述是 ADF 格式，需要提取文本）
         description_adf = fields.get("description", {})
         description = extract_text_from_adf(description_adf) if description_adf else "无描述"
@@ -655,8 +688,8 @@ def handle_jira_webhook(payload: dict) -> dict:
         image_url = attachments[0]["url"] if attachments else None
         
         # 发送通知
-        logger.info(f"Sending Jira notification for {issue_key}, event_type={event_type}")
-        result = send_notification(notification_text, image_url)
+        logger.info(f"Sending Jira notification for {issue_key}, event_type={event_type}, chat_id={chat_id}")
+        result = send_notification(notification_text, image_url, chat_id)
         
         if result.get("ok"):
             logger.info(f"Jira notification sent successfully for {issue_key}")
@@ -793,9 +826,16 @@ def clear_user_session(user_id: int):
 # Agent Logic
 # ============================================================
 
-def run_agent(user_id: int, user_message: str, image_analysis: str = None) -> dict:
+def run_agent(user_id: int, user_message: str, image_analysis: str = None, chat_id: int = None) -> dict:
     """
     运行 Agent 处理用户消息
+    
+    Args:
+        user_id: 用户 ID
+        user_message: 用户消息
+        image_analysis: 图片分析结果（可选）
+        chat_id: Telegram 群组 ID，用于保存到 Jira Issue
+    
     返回: {"reply": str, "jira_result": dict or None}
     """
     try:
@@ -864,7 +904,8 @@ def run_agent(user_id: int, user_message: str, image_analysis: str = None) -> di
                     result = create_jira_issue(
                         function_args["title"],
                         function_args["description"],
-                        function_args["bug_type"]
+                        function_args["bug_type"],
+                        chat_id=chat_id
                     )
                     
                     # 如果有待上传的图片，上传到 Issue
@@ -1065,7 +1106,7 @@ def process_message_async(chat_id: int, message_id: int, user_id: int, text: str
             edit_message(chat_id, status_msg_id, "⏳ 正在创建 Jira Issue...", parse_mode=None)
         
         # 运行 Agent
-        result = run_agent(user_id, user_message or "请根据截图分析问题", image_analysis)
+        result = run_agent(user_id, user_message or "请根据截图分析问题", image_analysis, chat_id=chat_id)
         
         # 删除状态消息
         if status_msg_id:
