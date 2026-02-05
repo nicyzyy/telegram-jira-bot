@@ -693,6 +693,7 @@ def format_jira_notification(issue_data: dict) -> str:
     summary = issue_data.get("summary", "无标题")
     description = issue_data.get("description", "")
     assignee_name = issue_data.get("assignee_name", "未指派")
+    status = issue_data.get("status", "未知")
     issue_url = issue_data.get("url", "")
     event_type = issue_data.get("event_type", "created")
     
@@ -711,6 +712,19 @@ def format_jira_notification(issue_data: dict) -> str:
         title_emoji = "📝"
         title_text = "BUG 更新"
     
+    # 状态表情映射
+    status_emoji_map = {
+        "待办": "🟡",
+        "To Do": "🟡",
+        "进行中": "🟠",
+        "In Progress": "🟠",
+        "已完成": "🟢",
+        "Done": "🟢",
+        "已关闭": "✅",
+        "Closed": "✅",
+    }
+    status_emoji = status_emoji_map.get(status, "⚪")
+    
     # 构建消息
     lines = [
         f"{title_emoji} *{title_text}*: {issue_key}",
@@ -718,6 +732,8 @@ def format_jira_notification(issue_data: dict) -> str:
         f"📌 *标题*: {summary}",
         f"",
         f"📝 *描述*: {description}",
+        f"",
+        f"{status_emoji} *状态*: {status}",
         f"",
         f"👤 *指派给*: {assignee_name}",
         f"",
@@ -747,14 +763,15 @@ def handle_jira_webhook(payload: dict) -> dict:
         description_adf = fields.get("description", {})
         description = extract_text_from_adf(description_adf) if description_adf else "无描述"
         
-        # 获取指派人
+        # 获取任务状态
+        status = fields.get("status", {})
+        status_name = status.get("name", "未知") if status else "未知"
+        
+        # 获取指派人 - 使用 Jira 显示名称
         assignee = fields.get("assignee", {})
         assignee_id = assignee.get("accountId", "") if assignee else ""
-        assignee_name = assignee.get("displayName", "") if assignee else "未指派"
-        
-        # 如果有映射，使用映射名称
-        if assignee_id in ASSIGNEE_NAMES:
-            assignee_name = ASSIGNEE_NAMES[assignee_id]
+        # 优先使用 Jira 中的 displayName（昵称）
+        assignee_name = assignee.get("displayName", "未指派") if assignee else "未指派"
         
         # 确定事件类型
         event_type = "created"
@@ -777,6 +794,7 @@ def handle_jira_webhook(payload: dict) -> dict:
             "summary": summary,
             "description": description,
             "assignee_name": assignee_name,
+            "status": status_name,
             "url": f"https://{JIRA_DOMAIN}/browse/{issue_key}",
             "event_type": event_type
         }
