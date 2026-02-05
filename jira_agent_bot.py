@@ -44,6 +44,7 @@ NOTIFY_BOT_TOKEN = os.getenv("NOTIFY_BOT_TOKEN", "")
 # 通知群组 ID 列表
 # 优先从环境变量读取（持久化），同时支持运行时动态添加
 NOTIFY_GROUP_IDS_ENV = os.getenv("NOTIFY_GROUP_IDS", "")  # 逗号分隔的群组 ID
+logger.info(f"NOTIFY_GROUP_IDS_ENV value: '{NOTIFY_GROUP_IDS_ENV}'")
 NOTIFY_GROUPS_FILE = "/tmp/notify_groups.json"
 
 # 运行时群组缓存（内存中）
@@ -52,14 +53,19 @@ _runtime_notify_groups = set()
 def get_env_notify_groups() -> set:
     """从环境变量获取预设的群组 ID"""
     groups = set()
+    logger.info(f"Reading NOTIFY_GROUP_IDS_ENV: '{NOTIFY_GROUP_IDS_ENV}'")
     if NOTIFY_GROUP_IDS_ENV:
         for gid in NOTIFY_GROUP_IDS_ENV.split(","):
             gid = gid.strip()
+            logger.info(f"Processing group ID: '{gid}'")
             if gid:
                 try:
                     groups.add(int(gid))
+                    logger.info(f"Added group ID from env: {gid}")
                 except ValueError:
                     logger.warning(f"Invalid group ID in NOTIFY_GROUP_IDS: {gid}")
+    else:
+        logger.warning("NOTIFY_GROUP_IDS_ENV is empty or not set")
     return groups
 
 def load_notify_groups() -> set:
