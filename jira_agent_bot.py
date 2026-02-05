@@ -277,6 +277,16 @@ def create_jira_issue(title: str, description: str, bug_type: str) -> dict:
 
         assignee_id = ASSIGNEE_DEV if "开发" in bug_type else ASSIGNEE_UI
         
+        # 添加类型前缀到标题
+        if "开发" in bug_type:
+            prefix = "【开发】"
+        else:
+            prefix = "【UI】"
+        
+        # 如果标题已经有类似前缀，不重复添加
+        if not title.startswith("【"):
+            title = prefix + title
+        
         # 截断过长的标题
         if len(title) > 250:
             title = title[:247] + "..."
@@ -569,15 +579,23 @@ def run_agent(user_id: int, user_message: str, image_analysis: str = None) -> di
         messages.extend(get_user_session(user_id))
         
         # 调用 OpenAI
-        response = client.chat.completions.create(
-            model="gpt-5",
-            messages=messages,
-            tools=tools,
-            tool_choice="auto",
-            max_completion_tokens=2000
-        )
+        logger.info(f"Calling OpenAI API for agent decision...")
+        try:
+            response = client.chat.completions.create(
+                model="gpt-5",
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+                max_completion_tokens=2000,
+                timeout=120  # 增加超时时间
+            )
+            logger.info(f"OpenAI API response received")
+        except Exception as api_error:
+            logger.error(f"OpenAI API call failed: {api_error}")
+            raise
         
         assistant_message = response.choices[0].message
+        logger.info(f"Assistant message: tool_calls={assistant_message.tool_calls is not None}, content={assistant_message.content[:50] if assistant_message.content else 'None'}...")
         
         jira_result = None
         
@@ -819,9 +837,9 @@ def process_message_async(chat_id: int, message_id: int, user_id: int, text: str
         
     except Exception as e:
         error_message = str(e)
-        print(f"Error processing message: {error_message}")
+        logger.error(f"Error processing message: {error_message}")
         import traceback
-        traceback.print_exc()
+        logger.error(f"Traceback: {traceback.format_exc()}")
         
         if status_msg_id:
             delete_message(chat_id, status_msg_id)
