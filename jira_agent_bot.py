@@ -38,9 +38,19 @@ JIRA_PROJECT_KEY = os.getenv("JIRA_PROJECT_KEY", "BB")
 PORT = int(os.getenv("PORT", 10000))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 
+# --- Notification Bot (for Jira webhook notifications) ---
+NOTIFY_BOT_TOKEN = os.getenv("NOTIFY_BOT_TOKEN", "")
+NOTIFY_CHAT_ID = os.getenv("NOTIFY_CHAT_ID", "")  # 群组 ID，用于发送通知
+
 # --- Assignee IDs ---
 ASSIGNEE_DEV = "712020:29364cb3-1ba1-453c-8e28-4e0306787939"
 ASSIGNEE_UI = "712020:7b0eae8d-9cc3-406b-814e-bbbe51c67cbd"
+
+# --- Assignee ID to Name Mapping ---
+ASSIGNEE_NAMES = {
+    "712020:29364cb3-1ba1-453c-8e28-4e0306787939": "开发负责人",
+    "712020:7b0eae8d-9cc3-406b-814e-bbbe51c67cbd": "UI负责人"
+}
 
 # --- OpenAI Client ---
 client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_API_BASE) if OPENAI_API_BASE else OpenAI(api_key=OPENAI_API_KEY)
@@ -440,6 +450,247 @@ def get_jira_issue(issue_key: str) -> dict:
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+# ============================================================
+# Notification Bot Functions (Jira Webhook Notifications)
+# ============================================================
+
+def notify_bot_api(method: str, data: dict = None, files: dict = None) -> dict:
+    """调用通知机器人的 Telegram Bot API"""
+    if not NOTIFY_BOT_TOKEN:
+        logger.warning("NOTIFY_BOT_TOKEN not set, notification skipped")
+        return {"ok": False, "error": "NOTIFY_BOT_TOKEN not set"}
+    
+    url = f"https://api.telegram.org/bot{NOTIFY_BOT_TOKEN}/{method}"
+    try:
+        if files:
+            response = requests.post(url, data=data, files=files, timeout=30)
+        elif data:
+            response = requests.post(url, json=data, timeout=30)
+        else:
+            response = requests.get(url, timeout=30)
+        return response.json()
+    except Exception as e:
+        logger.error(f"Notify Bot API error: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+def send_notification(text: str, image_url: str = None) -> dict:
+    """通过通知机器人发送消息到群组"""
+    if not NOTIFY_CHAT_ID:
+        logger.warning("NOTIFY_CHAT_ID not set, notification skipped")
+        return {"ok": False, "error": "NOTIFY_CHAT_ID not set"}
+    
+    chat_id = int(NOTIFY_CHAT_ID)
+    
+    # 如果有图片，先发送图片再发送文字
+    if image_url:
+        try:
+            # 尝试下载图片并发送
+            logger.info(f"Downloading image from Jira: {image_url}")
+            auth = (JIRA_EMAIL, JIRA_API_TOKEN)
+            img_response = requests.get(image_url, auth=auth, timeout=30)
+            if img_response.status_code == 200:
+                # 发送图片并附带文字
+                files = {"photo": ("attachment.jpg", img_response.content, "image/jpeg")}
+                data = {
+                    "chat_id": chat_id,
+                    "caption": text,
+                    "parse_mode": "Markdown"
+                }
+                result = notify_bot_api("sendPhoto", data=data, files=files)
+                if result.get("ok"):
+                    return result
+                else:
+                    logger.warning(f"Failed to send photo: {result}, falling back to text only")
+        except Exception as e:
+            logger.error(f"Error sending photo notification: {e}")
+    
+    # 发送纯文字消息
+    data = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown"
+    }
+    result = notify_bot_api("sendMessage", data)
+    
+    # 如果 Markdown 解析失败，尝试不带格式发送
+    if not result.get("ok") and "parse" in str(result.get("description", "")).lower():
+        data.pop("parse_mode", None)
+        result = notify_bot_api("sendMessage", data)
+    
+    return result
+
+
+def get_jira_issue_attachments(issue_key: str) -> list:
+    """获取 Jira Issue 的附件列表"""
+    try:
+        url = f"https://{JIRA_DOMAIN}/rest/api/3/issue/{issue_key}?fields=attachment"
+        auth = (JIRA_EMAIL, JIRA_API_TOKEN)
+        headers = {"Accept": "application/json"}
+        
+        response = requests.get(url, headers=headers, auth=auth, timeout=30)
+        response.raise_for_status()
+        
+        issue = response.json()
+        attachments = issue.get("fields", {}).get("attachment", [])
+        
+        # 返回图片附件的 URL
+        image_attachments = []
+        for att in attachments:
+            mime_type = att.get("mimeType", "")
+            if mime_type.startswith("image/"):
+                image_attachments.append({
+                    "filename": att.get("filename"),
+                    "url": att.get("content"),
+                    "thumbnail": att.get("thumbnail")
+                })
+        
+        return image_attachments
+    except Exception as e:
+        logger.error(f"Error getting attachments for {issue_key}: {e}")
+        return []
+
+
+def format_jira_notification(issue_data: dict) -> str:
+    """格式化 Jira 通知消息"""
+    issue_key = issue_data.get("key", "")
+    summary = issue_data.get("summary", "无标题")
+    description = issue_data.get("description", "")
+    assignee_name = issue_data.get("assignee_name", "未指派")
+    issue_url = issue_data.get("url", "")
+    event_type = issue_data.get("event_type", "created")
+    
+    # 截断描述
+    if len(description) > 200:
+        description = description[:197] + "..."
+    
+    # 根据事件类型选择标题
+    if event_type == "created":
+        title_emoji = "🆕"
+        title_text = "新建 BUG"
+    elif event_type == "assigned":
+        title_emoji = "👤"
+        title_text = "BUG 已指派"
+    else:
+        title_emoji = "📝"
+        title_text = "BUG 更新"
+    
+    # 构建消息
+    lines = [
+        f"{title_emoji} *{title_text}*: {issue_key}",
+        f"",
+        f"📌 *标题*: {summary}",
+        f"",
+        f"📝 *描述*: {description}",
+        f"",
+        f"👤 *指派给*: {assignee_name}",
+        f"",
+        f"🔗 {issue_url}"
+    ]
+    
+    return "\n".join(lines)
+
+
+def handle_jira_webhook(payload: dict) -> dict:
+    """处理 Jira Webhook 请求"""
+    try:
+        webhook_event = payload.get("webhookEvent", "")
+        issue = payload.get("issue", {})
+        
+        if not issue:
+            logger.info("No issue in Jira webhook payload")
+            return {"ok": False, "error": "No issue in payload"}
+        
+        issue_key = issue.get("key", "")
+        fields = issue.get("fields", {})
+        
+        # 获取基本信息
+        summary = fields.get("summary", "无标题")
+        
+        # 获取描述（Jira 描述是 ADF 格式，需要提取文本）
+        description_adf = fields.get("description", {})
+        description = extract_text_from_adf(description_adf) if description_adf else "无描述"
+        
+        # 获取指派人
+        assignee = fields.get("assignee", {})
+        assignee_id = assignee.get("accountId", "") if assignee else ""
+        assignee_name = assignee.get("displayName", "") if assignee else "未指派"
+        
+        # 如果有映射，使用映射名称
+        if assignee_id in ASSIGNEE_NAMES:
+            assignee_name = ASSIGNEE_NAMES[assignee_id]
+        
+        # 确定事件类型
+        event_type = "created"
+        if "issue_created" in webhook_event:
+            event_type = "created"
+        elif "issue_assigned" in webhook_event or "issue_updated" in webhook_event:
+            # 检查是否是指派事件
+            changelog = payload.get("changelog", {})
+            items = changelog.get("items", [])
+            for item in items:
+                if item.get("field") == "assignee":
+                    event_type = "assigned"
+                    break
+            else:
+                event_type = "updated"
+        
+        # 构建通知数据
+        issue_data = {
+            "key": issue_key,
+            "summary": summary,
+            "description": description,
+            "assignee_name": assignee_name,
+            "url": f"https://{JIRA_DOMAIN}/browse/{issue_key}",
+            "event_type": event_type
+        }
+        
+        # 格式化通知消息
+        notification_text = format_jira_notification(issue_data)
+        
+        # 获取附件图片
+        attachments = get_jira_issue_attachments(issue_key)
+        image_url = attachments[0]["url"] if attachments else None
+        
+        # 发送通知
+        logger.info(f"Sending Jira notification for {issue_key}, event_type={event_type}")
+        result = send_notification(notification_text, image_url)
+        
+        if result.get("ok"):
+            logger.info(f"Jira notification sent successfully for {issue_key}")
+        else:
+            logger.error(f"Failed to send Jira notification: {result}")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error handling Jira webhook: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return {"ok": False, "error": str(e)}
+
+
+def extract_text_from_adf(adf: dict) -> str:
+    """从 Jira ADF (Atlassian Document Format) 中提取纯文本"""
+    if not adf or not isinstance(adf, dict):
+        return ""
+    
+    text_parts = []
+    
+    def extract_recursive(node):
+        if isinstance(node, dict):
+            if node.get("type") == "text":
+                text_parts.append(node.get("text", ""))
+            for child in node.get("content", []):
+                extract_recursive(child)
+        elif isinstance(node, list):
+            for item in node:
+                extract_recursive(item)
+    
+    extract_recursive(adf)
+    return " ".join(text_parts)
 
 
 # ============================================================
@@ -949,6 +1200,33 @@ def webhook():
         import traceback
         traceback.print_exc()
         # 即使出错也返回 200，避免 Telegram 重试
+        return Response('OK', status=200)
+
+
+@app.route('/jira-webhook', methods=['POST'])
+def jira_webhook():
+    """Jira Webhook 端点，接收 Jira 事件通知"""
+    try:
+        payload = request.get_json(force=True)
+        webhook_event = payload.get("webhookEvent", "")
+        issue_key = payload.get("issue", {}).get("key", "unknown")
+        
+        logger.info(f"Received Jira webhook: event={webhook_event}, issue={issue_key}")
+        sys.stdout.flush()
+        
+        # 只处理 issue 创建和更新事件
+        if "issue" in webhook_event:
+            # 在后台线程处理，立即返回
+            thread = threading.Thread(target=handle_jira_webhook, args=(payload,))
+            thread.daemon = True
+            thread.start()
+        
+        return Response('OK', status=200)
+        
+    except Exception as e:
+        logger.error(f"Jira webhook error: {e}")
+        import traceback
+        traceback.print_exc()
         return Response('OK', status=200)
 
 
