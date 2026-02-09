@@ -1216,13 +1216,20 @@ def process_message_async(chat_id: int, message_id: int, user_id: int, text: str
         logger.info(f"[Async] Starting to process message: text='{text[:50] if text else ''}...', photo={photo_file_id is not None}, status_msg_id={status_msg_id}")
         
         bot_username = get_bot_username()
-        user_message = text.replace(f"@{bot_username}", "").strip()
+        # 使用大小写不敏感的替换去掉 @bot_username
+        import re
+        if bot_username:
+            user_message = re.sub(rf'@{re.escape(bot_username)}', '', text, flags=re.IGNORECASE).strip()
+        else:
+            user_message = text.strip()
+        
+        logger.info(f"[Async] user_message after removing bot mention: '{user_message[:80] if user_message else ''}'")
         
         if not user_message and not photo_file_id:
             if status_msg_id:
-                edit_message(chat_id, status_msg_id, "请告诉我你遇到了什么问题？可以附上截图。", parse_mode=None)
+                edit_message(chat_id, status_msg_id, "请描述你遇到的问题，我会直接创建 Jira Issue。", parse_mode=None)
             else:
-                send_message(chat_id, "请告诉我你遇到了什么问题？可以附上截图。", message_id, parse_mode=None)
+                send_message(chat_id, "请描述你遇到的问题，我会直接创建 Jira Issue。", message_id, parse_mode=None)
             return
         
         image_analysis = None
@@ -1292,15 +1299,20 @@ def process_message_async(chat_id: int, message_id: int, user_id: int, text: str
         send_message(chat_id, f"❌ 处理失败：{error_message}", message_id, parse_mode=None)
 
 
-def handle_user_message(chat_id: int, message_id: int, user_id: int, text: str, photo_file_id: str = None):
+def handle_user_message(chat_id: int, message_id: int, user_id: int, text: str, photo_file_id: str = None, mentioned_bot: bool = False):
     """处理用户消息 - 先发送即时反馈，然后启动异步处理线程"""
-    # 检查是否 @ 了机器人
+    # 检查是否 @ 了机器人（使用从 entities 解析的结果，更可靠）
     bot_username = get_bot_username()
-    logger.info(f"Checking bot mention: bot_username={bot_username}, text contains @{bot_username}: {f'@{bot_username}' in text if bot_username else 'N/A'}")
     
-    if not bot_username or f"@{bot_username}" not in text:
+    # 双重检查：entities 解析 或 文本包含 @bot_username（忽略大小写）
+    if not mentioned_bot and bot_username:
+        mentioned_bot = f"@{bot_username.lower()}" in text.lower()
+    
+    logger.info(f"Checking bot mention: bot_username={bot_username}, mentioned_bot={mentioned_bot}, text='{text[:80] if text else ''}'")
+    
+    if not mentioned_bot:
         # 没有 @ 机器人，不处理
-        logger.info(f"Message does not mention bot, skipping immediate feedback")
+        logger.info(f"Message does not mention bot, skipping")
         return
     
     # 立即发送确认消息（在主线程中）
@@ -1319,7 +1331,6 @@ def handle_user_message(chat_id: int, message_id: int, user_id: int, text: str, 
         logger.info(f"Immediate feedback sent successfully, status_msg_id: {status_msg_id}")
     else:
         logger.error(f"Failed to send immediate feedback: {status_result}")
-        # 即使发送失败也继续处理，只是没有状态消息可更新
     
     # 在后台线程中处理消息
     thread = threading.Thread(
@@ -1367,8 +1378,21 @@ def webhook():
         user_id = message.get("from", {}).get("id")
         text = message.get("text") or message.get("caption") or ""
         has_photo = bool(message.get("photo"))
+        has_video = bool(message.get("video"))
+        has_document = bool(message.get("document"))
         
-        logger.info(f"Message from chat {chat_id}, user {user_id}: text='{text[:50] if text else ''}...', has_photo={has_photo}")
+        # 检查 entities 或 caption_entities 中是否有 @mention
+        entities = message.get("entities") or message.get("caption_entities") or []
+        mentioned_bot = False
+        bot_username = get_bot_username()
+        for entity in entities:
+            if entity.get("type") == "mention" and bot_username:
+                mention_text = text[entity["offset"]:entity["offset"] + entity["length"]]
+                if mention_text.lower() == f"@{bot_username.lower()}":
+                    mentioned_bot = True
+                    break
+        
+        logger.info(f"Message from chat {chat_id}, user {user_id}: text='{text[:80] if text else ''}', has_photo={has_photo}, has_video={has_video}, has_document={has_document}, mentioned_bot={mentioned_bot}")
         
         # 处理命令
         if text.startswith("/start"):
@@ -1384,7 +1408,18 @@ def webhook():
                 # 获取最大尺寸的图片
                 photo_file_id = message["photo"][-1]["file_id"]
             
-            handle_user_message(chat_id, message_id, user_id, text, photo_file_id)
+            # 支持视频消息的缩略图作为截图
+            video_info = None
+            if message.get("video"):
+                video_info = message["video"]
+                # 如果视频有缩略图，可以用来分析
+                if video_info.get("thumb") or video_info.get("thumbnail"):
+                    thumb = video_info.get("thumbnail") or video_info.get("thumb")
+                    if thumb and not photo_file_id:
+                        photo_file_id = thumb.get("file_id")
+                        logger.info(f"Using video thumbnail as photo: {photo_file_id}")
+            
+            handle_user_message(chat_id, message_id, user_id, text, photo_file_id, mentioned_bot)
         
         # 立即返回 200，让 Telegram 知道我们已收到消息
         return Response('OK', status=200)
