@@ -321,19 +321,11 @@ def analyze_image_with_vision(image_base64: str, user_text: str) -> str:
         
         response = client.chat.completions.create(
             model="gpt-5.2",
-            max_completion_tokens=1500,
+            max_completion_tokens=300,
             messages=[
                 {
                     "role": "system",
-                    "content": """你是一位专业的软件测试工程师和 UI/UX 专家。
-请仔细分析用户提供的截图，结合用户的文字描述，提取以下信息：
-
-1. **界面元素识别**：识别截图中的关键 UI 元素（按钮、文本、图标、布局等）
-2. **问题定位**：根据用户描述，定位截图中可能存在问题的区域
-3. **视觉问题**：识别任何明显的视觉问题（对齐、颜色、间距、遮挡等）
-4. **交互问题**：推断可能的交互问题（按钮状态、反馈缺失等）
-
-请用简洁专业的语言描述你的分析结果，为后续创建 BUG 报告提供依据。"""
+                    "content": """你是 BUG 分析专家。请简洁分析截图，用 2-3 句话描述截图中显示的问题现象，不要写推测性内容。"""
                 },
                 {
                     "role": "user",
@@ -860,11 +852,11 @@ tools = [
                 "properties": {
                     "title": {
                         "type": "string",
-                        "description": "Issue 标题，简洁描述问题（不超过100字）"
+                        "description": "Issue 标题，一句话描述问题核心，不超过20字"
                     },
                     "description": {
                         "type": "string",
-                        "description": "详细的 BUG 描述，包括：问题现象、复现步骤、预期行为、实际行为、可能原因、修复建议"
+                        "description": "简洁的 BUG 描述，严格使用固定格式：'问题：XXX\n复现：XXX\n预期：XXX\n实际：XXX'，总字数不超过150字，禁止写原因分析和修复建议"
                     },
                     "bug_type": {
                         "type": "string",
@@ -965,24 +957,24 @@ def run_agent(user_id: int, user_message: str, image_analysis: str = None) -> di
         
         add_to_session(user_id, "user", full_message)
         
-        system_prompt = """你是一位专业的软件测试工程师和 BUG 分析专家。你的任务是：
+        system_prompt = """你是一位 BUG 分析专家。你的任务是将用户报告的问题直接创建为 Jira Issue。
 
-1. **分析用户报告的问题**：理解问题的本质，判断是功能BUG还是UI问题
-2. **直接创建 Issue**：不要反复询问，根据用户描述直接创建 Jira Issue
-3. **专业的 BUG 描述**：生成结构化的 BUG 报告，包括：
-   - 问题现象
-   - 复现步骤（如果可以推断）
-   - 预期行为 vs 实际行为
-   - 可能的根本原因分析
-   - 建议的修复方向
+**描述写作规则（极其重要）**：
+- 描述必须简洁，总字数不超过 150 字
+- 只写开发者需要知道的关键信息，不要写废话
+- 禁止写“可能的原因分析”、“修复建议”等推测性内容
+- 使用以下固定格式：
 
-4. **智能分类**：
-   - 功能异常、数据错误、性能问题 → 开发BUG
-   - 界面显示、交互体验、视觉问题 → UI/UX问题
+问题：[1句话描述问题现象]
+复现：[简要步骤，无法推断则写"用户反馈"]
+预期：[正确行为]
+实际：[异常行为]
 
-5. **如果用户提供了截图分析**：结合截图内容丰富 BUG 描述
+**分类规则**：
+- 功能异常、数据错误、性能问题 → 开发BUG
+- 界面显示、交互体验、视觉问题 → UI/UX问题
 
-请直接行动，高效处理用户的问题。"""
+请直接创建 Issue，不要反复询问。"""
 
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(get_user_session(user_id))
@@ -995,7 +987,7 @@ def run_agent(user_id: int, user_message: str, image_analysis: str = None) -> di
                 messages=messages,
                 tools=tools,
                 tool_choice={"type": "function", "function": {"name": "create_jira_issue"}},  # 强制调用 create_jira_issue
-                max_completion_tokens=2000,
+                max_completion_tokens=500,
                 timeout=120  # 增加超时时间
             )
             logger.info(f"OpenAI API response received")
