@@ -861,7 +861,7 @@ tools = [
                     "bug_type": {
                         "type": "string",
                         "enum": ["开发BUG", "UI/UX问题"],
-                        "description": "BUG 类型：功能性问题选'开发BUG'，界面/交互问题选'UI/UX问题'"
+                        "description": "BUG 类型分类。默认选'开发BUG'。只有纯视觉样式问题（颜色/字体/布局/图标显示）才选'UI/UX问题'。点击无反应、功能异常、动画缺失、卡死、崩溃等都是'开发BUG'"
                     }
                 },
                 "required": ["title", "description", "bug_type"]
@@ -962,7 +962,7 @@ def run_agent(user_id: int, user_message: str, image_analysis: str = None) -> di
 **描述写作规则（极其重要）**：
 - 描述必须简洁，总字数不超过 150 字
 - 只写开发者需要知道的关键信息，不要写废话
-- 禁止写“可能的原因分析”、“修复建议”等推测性内容
+- 禁止写"可能的原因分析"、"修复建议"等推测性内容
 - 使用以下固定格式：
 
 问题：[1句话描述问题现象]
@@ -970,9 +970,27 @@ def run_agent(user_id: int, user_message: str, image_analysis: str = None) -> di
 预期：[正确行为]
 实际：[异常行为]
 
-**分类规则**：
-- 功能异常、数据错误、性能问题 → 开发BUG
-- 界面显示、交互体验、视觉问题 → UI/UX问题
+**BUG 分类规则（极其重要，必须严格遵守）**：
+
+绝大多数 BUG 都是「开发BUG」，只有纯粹的视觉/美术问题才是「UI/UX问题」。
+
+选择「开发BUG」的情况（默认选这个）：
+- 点击按钮无反应、功能不生效
+- 操作后卡死、无响应、闪退、崩溃
+- 数据显示错误、数值计算错误
+- 加载失败、接口报错、网络异常
+- 流程中断、状态异常、逻辑错误
+- 动画缺失、动画不播放（属于程序逻辑问题）
+- 音效缺失、音频不播放
+- 任何"没有反应""无法操作"的问题
+
+选择「UI/UX问题」的情况（仅限以下）：
+- 文字显示错误（错别字、乱码、文案不对）
+- 图片/图标显示异常（模糊、拉伸、错位）
+- 颜色/字体/间距等纯视觉样式问题
+- 布局错乱、元素重叠（纯 CSS/样式问题）
+
+如果无法确定，默认选择「开发BUG」。
 
 请直接创建 Issue，不要反复询问。"""
 
@@ -1087,10 +1105,11 @@ def run_agent(user_id: int, user_message: str, image_analysis: str = None) -> di
 {image_analysis}
 """
             
-            # 判断 BUG 类型（默认为 UI/UX 问题）
-            bug_type = "UI/UX问题"
-            if any(kw in user_text.lower() for kw in ["功能", "报错", "崩溃", "异常", "数据", "接口", "api", "后台"]):
-                bug_type = "开发BUG"
+            # 判断 BUG 类型（默认为开发BUG，只有纯视觉问题才是 UI/UX）
+            bug_type = "开发BUG"
+            ui_keywords = ["颜色", "字体", "字号", "间距", "布局", "样式", "图标显示", "错别字", "乱码", "文案", "拼写", "像素", "对齐", "美观"]
+            if any(kw in user_text.lower() for kw in ui_keywords) and not any(kw in user_text.lower() for kw in ["无反应", "没反应", "点击", "卡死", "崩溃", "闪退", "报错", "失败", "无法"]):
+                bug_type = "UI/UX问题"
             
             logger.info(f"Fallback: Creating Jira issue with title: {title}, bug_type: {bug_type}")
             jira_result = create_jira_issue(title, description, bug_type)
