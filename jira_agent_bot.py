@@ -1540,60 +1540,82 @@ def jira_webhook():
         return Response('OK', status=200)
 
 
-def setup_webhook():
-    """设置 Telegram Webhook"""
+def setup_webhook(max_retries=5, retry_delay=10):
+    """设置 Telegram Webhook（带重试机制）"""
     if not WEBHOOK_URL:
         logger.warning("WEBHOOK_URL not set, webhook will not be configured")
         return False
     
     webhook_url = f"{WEBHOOK_URL}/webhook"
     
-    # 先删除旧的 webhook
-    delete_result = telegram_api("deleteWebhook", {"drop_pending_updates": True})
-    logger.info(f"Delete webhook response: {delete_result}")
+    for attempt in range(1, max_retries + 1):
+        try:
+            # 先删除旧的 webhook
+            delete_result = telegram_api("deleteWebhook", {"drop_pending_updates": True})
+            logger.info(f"[Attempt {attempt}/{max_retries}] Delete webhook response: {delete_result}")
+            
+            # 设置新的 webhook
+            set_result = telegram_api("setWebhook", {
+                "url": webhook_url,
+                "drop_pending_updates": True,
+                "allowed_updates": ["message", "edited_message"]
+            })
+            logger.info(f"[Attempt {attempt}/{max_retries}] Set webhook response: {set_result}")
+            
+            if set_result.get("ok", False):
+                logger.info(f"Main bot webhook set successfully on attempt {attempt}")
+                return True
+            else:
+                logger.warning(f"Webhook set returned ok=False on attempt {attempt}: {set_result}")
+        except Exception as e:
+            logger.error(f"[Attempt {attempt}/{max_retries}] Webhook setup error: {e}")
+        
+        if attempt < max_retries:
+            logger.info(f"Retrying webhook setup in {retry_delay} seconds...")
+            time.sleep(retry_delay)
     
-    # 设置新的 webhook
-    set_result = telegram_api("setWebhook", {
-        "url": webhook_url,
-        "drop_pending_updates": True,
-        "allowed_updates": ["message", "edited_message"]
-    })
-    logger.info(f"Set webhook response: {set_result}")
-    
-    return set_result.get("ok", False)
+    logger.error(f"Failed to set main bot webhook after {max_retries} attempts")
+    return False
 
 
-def setup_notify_webhook():
-    """设置通知机器人的 Webhook"""
+def setup_notify_webhook(max_retries=5, retry_delay=10):
+    """设置通知机器人的 Webhook（带重试机制）"""
     if not WEBHOOK_URL or not NOTIFY_BOT_TOKEN:
         logger.warning("WEBHOOK_URL or NOTIFY_BOT_TOKEN not set, notify webhook will not be configured")
         return False
     
     notify_webhook_url = f"{WEBHOOK_URL}/notify-webhook"
     
-    # 使用通知机器人的 Token
-    url = f"https://api.telegram.org/bot{NOTIFY_BOT_TOKEN}/setWebhook"
+    for attempt in range(1, max_retries + 1):
+        try:
+            # 先删除旧的 webhook
+            delete_url = f"https://api.telegram.org/bot{NOTIFY_BOT_TOKEN}/deleteWebhook"
+            delete_result = requests.post(delete_url, json={"drop_pending_updates": True}, timeout=30).json()
+            logger.info(f"[Attempt {attempt}/{max_retries}] Delete notify webhook response: {delete_result}")
+            
+            # 设置新的 webhook
+            url = f"https://api.telegram.org/bot{NOTIFY_BOT_TOKEN}/setWebhook"
+            set_result = requests.post(url, json={
+                "url": notify_webhook_url,
+                "drop_pending_updates": True,
+                "allowed_updates": ["message", "my_chat_member"]
+            }, timeout=30).json()
+            logger.info(f"[Attempt {attempt}/{max_retries}] Set notify webhook response: {set_result}")
+            
+            if set_result.get("ok", False):
+                logger.info(f"Notify bot webhook set successfully on attempt {attempt}")
+                return True
+            else:
+                logger.warning(f"Notify webhook set returned ok=False on attempt {attempt}: {set_result}")
+        except Exception as e:
+            logger.error(f"[Attempt {attempt}/{max_retries}] Notify webhook setup error: {e}")
+        
+        if attempt < max_retries:
+            logger.info(f"Retrying notify webhook setup in {retry_delay} seconds...")
+            time.sleep(retry_delay)
     
-    # 先删除旧的 webhook
-    delete_url = f"https://api.telegram.org/bot{NOTIFY_BOT_TOKEN}/deleteWebhook"
-    try:
-        delete_result = requests.post(delete_url, json={"drop_pending_updates": True}, timeout=30).json()
-        logger.info(f"Delete notify webhook response: {delete_result}")
-    except Exception as e:
-        logger.error(f"Error deleting notify webhook: {e}")
-    
-    # 设置新的 webhook
-    try:
-        set_result = requests.post(url, json={
-            "url": notify_webhook_url,
-            "drop_pending_updates": True,
-            "allowed_updates": ["message", "my_chat_member"]
-        }, timeout=30).json()
-        logger.info(f"Set notify webhook response: {set_result}")
-        return set_result.get("ok", False)
-    except Exception as e:
-        logger.error(f"Error setting notify webhook: {e}")
-        return False
+    logger.error(f"Failed to set notify bot webhook after {max_retries} attempts")
+    return False
 
 
 # ============================================================
