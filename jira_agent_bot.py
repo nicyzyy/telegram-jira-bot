@@ -150,9 +150,9 @@ client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_API_BASE) if OPENAI_API_
 # --- Flask App for Webhook ---
 app = Flask(__name__)
 
-# --- User Sessions and Pending Images ---
+# --- User Sessions and Pending Attachments ---
 user_sessions = {}
-pending_images = {}
+pending_attachments = {}  # {user_id: {"images": [{"bytes": ..., "filename": ...}], "videos": [{"bytes": ..., "filename": ...}]}}
 
 # --- Bot Username Cache ---
 bot_username_cache = None
@@ -277,15 +277,24 @@ def get_bot_username() -> str:
     return bot_username_cache
 
 
-def download_file(file_id: str) -> tuple:
-    """下载 Telegram 文件"""
+def download_file(file_id: str, default_ext: str = "jpg") -> tuple:
+    """下载 Telegram 文件（图片、视频等）"""
     try:
         # 获取文件路径
         result = telegram_api("getFile", {"file_id": file_id})
         if not result.get("ok"):
+            logger.error(f"getFile failed: {result}")
             return None, None
         
         file_path = result["result"]["file_path"]
+        file_size = result["result"].get("file_size", 0)
+        
+        logger.info(f"File info: path={file_path}, size={file_size} bytes")
+        
+        # Telegram Bot API 限制：最大 20MB
+        if file_size > 20 * 1024 * 1024:
+            logger.warning(f"File too large ({file_size} bytes), exceeds 20MB limit")
+            return None, None
         
         # 下载文件
         if file_path.startswith("http"):
@@ -293,11 +302,11 @@ def download_file(file_id: str) -> tuple:
         else:
             download_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
         
-        response = requests.get(download_url, timeout=60)
+        response = requests.get(download_url, timeout=120)
         response.raise_for_status()
         
-        filename = file_path.split('/')[-1] if '/' in file_path else f"photo_{file_id}.jpg"
-        logger.info(f"Photo downloaded: {filename}, {len(response.content)} bytes")
+        filename = file_path.split('/')[-1] if '/' in file_path else f"file_{file_id}.{default_ext}"
+        logger.info(f"File downloaded: {filename}, {len(response.content)} bytes")
         
         return response.content, filename
     except Exception as e:
@@ -460,8 +469,19 @@ def create_jira_issue(title: str, description: str, bug_type: str) -> dict:
         return {"success": False, "error": str(e)}
 
 
-def upload_attachment_to_jira(issue_key: str, image_bytes: bytes, filename: str) -> dict:
-    """上传附件到 Jira Issue"""
+def get_mime_type(filename: str) -> str:
+    """根据文件名获取 MIME 类型"""
+    ext = filename.lower().rsplit('.', 1)[-1] if '.' in filename else ''
+    mime_map = {
+        'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png', 'gif': 'image/gif',
+        'mp4': 'video/mp4', 'avi': 'video/avi', 'mov': 'video/quicktime', 'mkv': 'video/x-matroska',
+        'webm': 'video/webm', '3gp': 'video/3gpp',
+    }
+    return mime_map.get(ext, 'application/octet-stream')
+
+
+def upload_attachment_to_jira(issue_key: str, file_bytes: bytes, filename: str) -> dict:
+    """上传附件到 Jira Issue（支持图片和视频）"""
     try:
         url = f"https://{JIRA_DOMAIN}/rest/api/3/issue/{issue_key}/attachments"
         auth = (JIRA_EMAIL, JIRA_API_TOKEN)
@@ -470,19 +490,20 @@ def upload_attachment_to_jira(issue_key: str, image_bytes: bytes, filename: str)
             "X-Atlassian-Token": "no-check"
         }
         
+        mime_type = get_mime_type(filename)
         files = {
-            "file": (filename, image_bytes, "image/jpeg")
+            "file": (filename, file_bytes, mime_type)
         }
         
-        print(f"Uploading attachment to {issue_key}...")
-        response = requests.post(url, headers=headers, auth=auth, files=files, timeout=60)
+        logger.info(f"Uploading attachment to {issue_key}: {filename} ({len(file_bytes)} bytes, {mime_type})")
+        response = requests.post(url, headers=headers, auth=auth, files=files, timeout=120)
         response.raise_for_status()
         
-        print(f"Attachment uploaded successfully to {issue_key}")
+        logger.info(f"Attachment uploaded successfully to {issue_key}: {filename}")
         return {"success": True, "result": response.json()}
         
     except Exception as e:
-        print(f"Attachment upload error: {e}")
+        logger.error(f"Attachment upload error: {e}")
         return {"success": False, "error": str(e)}
 
 
@@ -929,8 +950,8 @@ def clear_user_session(user_id: int):
     """清除用户会话"""
     if user_id in user_sessions:
         del user_sessions[user_id]
-    if user_id in pending_images:
-        del pending_images[user_id]
+    if user_id in pending_attachments:
+        del pending_attachments[user_id]
 
 
 # ============================================================
@@ -1035,17 +1056,22 @@ def run_agent(user_id: int, user_message: str, image_analysis: str = None) -> di
                         function_args["bug_type"]
                     )
                     
-                    # 如果有待上传的图片，上传到 Issue
-                    if result.get("success") and user_id in pending_images:
-                        image_data = pending_images[user_id]
-                        upload_result = upload_attachment_to_jira(
-                            result["issue_key"],
-                            image_data["bytes"],
-                            image_data["filename"]
-                        )
-                        if upload_result.get("success"):
+                    # 如果有待上传的附件（图片/视频），上传到 Issue
+                    if result.get("success") and user_id in pending_attachments:
+                        attachments = pending_attachments[user_id]
+                        uploaded_types = []
+                        for img in attachments.get("images", []):
+                            upload_result = upload_attachment_to_jira(result["issue_key"], img["bytes"], img["filename"])
+                            if upload_result.get("success"):
+                                uploaded_types.append("image")
+                        for vid in attachments.get("videos", []):
+                            upload_result = upload_attachment_to_jira(result["issue_key"], vid["bytes"], vid["filename"])
+                            if upload_result.get("success"):
+                                uploaded_types.append("video")
+                        if uploaded_types:
                             result["attachment_uploaded"] = True
-                        del pending_images[user_id]
+                            result["uploaded_types"] = uploaded_types
+                        del pending_attachments[user_id]
                     
                     jira_result = result
                     tool_results.append({
@@ -1114,20 +1140,25 @@ def run_agent(user_id: int, user_message: str, image_analysis: str = None) -> di
             logger.info(f"Fallback: Creating Jira issue with title: {title}, bug_type: {bug_type}")
             jira_result = create_jira_issue(title, description, bug_type)
             
-            # 如果有待上传的图片，上传到 Issue
-            if jira_result.get("success") and user_id in pending_images:
-                image_data = pending_images[user_id]
-                upload_result = upload_attachment_to_jira(
-                    jira_result["issue_key"],
-                    image_data["bytes"],
-                    image_data["filename"]
-                )
-                if upload_result.get("success"):
+            # 如果有待上传的附件（图片/视频），上传到 Issue
+            if jira_result.get("success") and user_id in pending_attachments:
+                attachments = pending_attachments[user_id]
+                uploaded_types = []
+                for img in attachments.get("images", []):
+                    upload_result = upload_attachment_to_jira(jira_result["issue_key"], img["bytes"], img["filename"])
+                    if upload_result.get("success"):
+                        uploaded_types.append("image")
+                for vid in attachments.get("videos", []):
+                    upload_result = upload_attachment_to_jira(jira_result["issue_key"], vid["bytes"], vid["filename"])
+                    if upload_result.get("success"):
+                        uploaded_types.append("video")
+                if uploaded_types:
                     jira_result["attachment_uploaded"] = True
-                del pending_images[user_id]
+                    jira_result["uploaded_types"] = uploaded_types
+                del pending_attachments[user_id]
             
             if jira_result.get("success"):
-                reply = f"✅ 已创建 Jira Issue: {jira_result['issue_key']}\n📝 {jira_result['title'][:50]}...\n📎 截图已附加\n🔗 {jira_result['issue_url']}"
+                reply = f"✅ 已创建 Jira Issue: {jira_result['issue_key']}\n📝 {jira_result['title'][:50]}...\n🔗 {jira_result['issue_url']}"
             else:
                 reply = f"❌ 创建 Jira Issue 失败：{jira_result.get('error', '未知错误')}"
         
@@ -1222,17 +1253,28 @@ def format_jira_success_message(jira_result: dict) -> str:
     ]
     
     if has_attachment:
-        lines.append("📎 截图已附加")
+        uploaded_types = jira_result.get("uploaded_types", [])
+        img_count = uploaded_types.count("image")
+        vid_count = uploaded_types.count("video")
+        attach_parts = []
+        if img_count > 0:
+            attach_parts.append(f"截图{img_count}张")
+        if vid_count > 0:
+            attach_parts.append(f"视频{vid_count}个")
+        if attach_parts:
+            lines.append(f"📎 附件已上传: {', '.join(attach_parts)}")
+        else:
+            lines.append("📎 附件已上传")
     
     lines.append(f"🔗 {issue_url}")
     
     return "\n".join(lines)
 
 
-def process_message_async(chat_id: int, message_id: int, user_id: int, text: str, photo_file_id: str = None, status_msg_id: int = None):
+def process_message_async(chat_id: int, message_id: int, user_id: int, text: str, photo_file_id: str = None, status_msg_id: int = None, video_file_id: str = None):
     """异步处理用户消息（即时反馈已在主线程发送）"""
     try:
-        logger.info(f"[Async] Starting to process message: text='{text[:50] if text else ''}...', photo={photo_file_id is not None}, status_msg_id={status_msg_id}")
+        logger.info(f"[Async] Starting to process message: text='{text[:50] if text else ''}...', photo={photo_file_id is not None}, video={video_file_id is not None}, status_msg_id={status_msg_id}")
         
         bot_username = get_bot_username()
         # 使用大小写不敏感的替换去掉 @bot_username
@@ -1244,20 +1286,43 @@ def process_message_async(chat_id: int, message_id: int, user_id: int, text: str
         
         logger.info(f"[Async] user_message after removing bot mention: '{user_message[:80] if user_message else ''}'")
         
-        if not user_message and not photo_file_id:
+        if not user_message and not photo_file_id and not video_file_id:
             if status_msg_id:
                 edit_message(chat_id, status_msg_id, "请描述你遇到的问题，我会直接创建 Jira Issue。", parse_mode=None)
             else:
                 send_message(chat_id, "请描述你遇到的问题，我会直接创建 Jira Issue。", message_id, parse_mode=None)
             return
         
+        # 初始化附件存储
+        if user_id not in pending_attachments:
+            pending_attachments[user_id] = {"images": [], "videos": []}
+        else:
+            pending_attachments[user_id] = {"images": [], "videos": []}
+        
         image_analysis = None
         
-        # 如果有图片，下载并分析
+        # 如果有视频，下载视频文件
+        if video_file_id:
+            logger.info(f"Processing video: {video_file_id}")
+            
+            if status_msg_id:
+                edit_message(chat_id, status_msg_id, "🎬 正在下载视频...", parse_mode=None)
+            
+            video_bytes, video_filename = download_file(video_file_id, default_ext="mp4")
+            
+            if video_bytes:
+                pending_attachments[user_id]["videos"].append({
+                    "bytes": video_bytes,
+                    "filename": video_filename
+                })
+                logger.info(f"Video downloaded and stored: {video_filename}, {len(video_bytes)} bytes")
+            else:
+                logger.warning("Video download failed (may exceed 20MB Telegram limit)")
+        
+        # 如果有图片（或视频缩略图），下载并分析
         if photo_file_id:
             logger.info(f"Processing photo: {photo_file_id}")
             
-            # 更新状态：正在下载图片
             if status_msg_id:
                 edit_message(chat_id, status_msg_id, "📸 正在下载截图...", parse_mode=None)
             
@@ -1265,12 +1330,11 @@ def process_message_async(chat_id: int, message_id: int, user_id: int, text: str
             
             if image_bytes:
                 # 存储图片用于后续上传到 Jira
-                pending_images[user_id] = {
+                pending_attachments[user_id]["images"].append({
                     "bytes": image_bytes,
                     "filename": filename
-                }
+                })
                 
-                # 更新状态：正在分析图片
                 if status_msg_id:
                     edit_message(chat_id, status_msg_id, "🔍 正在分析截图内容...", parse_mode=None)
                 
@@ -1318,7 +1382,7 @@ def process_message_async(chat_id: int, message_id: int, user_id: int, text: str
         send_message(chat_id, f"❌ 处理失败：{error_message}", message_id, parse_mode=None)
 
 
-def handle_user_message(chat_id: int, message_id: int, user_id: int, text: str, photo_file_id: str = None, mentioned_bot: bool = False):
+def handle_user_message(chat_id: int, message_id: int, user_id: int, text: str, photo_file_id: str = None, mentioned_bot: bool = False, video_file_id: str = None):
     """处理用户消息 - 先发送即时反馈，然后启动异步处理线程"""
     # 检查是否 @ 了机器人（使用从 entities 解析的结果，更可靠）
     bot_username = get_bot_username()
@@ -1335,7 +1399,9 @@ def handle_user_message(chat_id: int, message_id: int, user_id: int, text: str, 
         return
     
     # 立即发送确认消息（在主线程中）
-    if photo_file_id:
+    if video_file_id:
+        status_text = "🎬 收到视频，正在下载并分析问题..."
+    elif photo_file_id:
         status_text = "📸 收到截图，正在分析图片和问题..."
     else:
         status_text = "📝 收到问题，正在分析..."
@@ -1354,7 +1420,7 @@ def handle_user_message(chat_id: int, message_id: int, user_id: int, text: str, 
     # 在后台线程中处理消息
     thread = threading.Thread(
         target=process_message_async,
-        args=(chat_id, message_id, user_id, text, photo_file_id, status_msg_id)
+        args=(chat_id, message_id, user_id, text, photo_file_id, status_msg_id, video_file_id)
     )
     thread.daemon = True
     thread.start()
@@ -1427,18 +1493,22 @@ def webhook():
                 # 获取最大尺寸的图片
                 photo_file_id = message["photo"][-1]["file_id"]
             
-            # 支持视频消息的缩略图作为截图
-            video_info = None
+            # 提取视频信息
+            video_file_id = None
             if message.get("video"):
-                video_info = message["video"]
-                # 如果视频有缩略图，可以用来分析
-                if video_info.get("thumb") or video_info.get("thumbnail"):
-                    thumb = video_info.get("thumbnail") or video_info.get("thumb")
-                    if thumb and not photo_file_id:
+                video = message["video"]
+                video_file_id = video.get("file_id")
+                video_size = video.get("file_size", 0)
+                logger.info(f"Video detected: file_id={video_file_id}, size={video_size} bytes, mime={video.get('mime_type')}")
+                
+                # 如果视频有缩略图且没有图片，用缩略图做 Vision 分析
+                if not photo_file_id:
+                    thumb = video.get("thumbnail") or video.get("thumb")
+                    if thumb:
                         photo_file_id = thumb.get("file_id")
-                        logger.info(f"Using video thumbnail as photo: {photo_file_id}")
+                        logger.info(f"Using video thumbnail as photo for analysis: {photo_file_id}")
             
-            handle_user_message(chat_id, message_id, user_id, text, photo_file_id, mentioned_bot)
+            handle_user_message(chat_id, message_id, user_id, text, photo_file_id, mentioned_bot, video_file_id)
         
         # 立即返回 200，让 Telegram 知道我们已收到消息
         return Response('OK', status=200)
